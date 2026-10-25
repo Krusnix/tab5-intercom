@@ -26,6 +26,8 @@ constexpr uint32_t kTaskStackBytes = 6144;
 constexpr UBaseType_t kTaskPriority = 5;
 // PPA scale factors have 1/16 steps.
 constexpr int kScaleUnits = 16;
+// Biggest own camera picture kept for the self view.
+constexpr size_t kMaxSelfPictureBytes = 256 * 1024;
 
 inline uint32_t align_up(uint32_t value, uint32_t alignment) {
   return (value + alignment - 1U) & ~(alignment - 1U);
@@ -95,6 +97,32 @@ void Tab5VideoView::setup() {
     return;
   }
 
+  if (this->self_enabled_) {
+    this->self_au_buf_ = static_cast<uint8_t *>(
+        heap_caps_aligned_alloc(64, kMaxSelfPictureBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    this->self_au_cap_ = this->self_au_buf_ == nullptr ? 0 : kMaxSelfPictureBytes;
+    const size_t self_bytes =
+        static_cast<size_t>(align_up(this->self_max_w_, 16)) * align_up(this->self_max_h_, 16) * 2U;
+    this->self_surface_ =
+        static_cast<uint8_t *>(jpeg_alloc_decoder_mem(self_bytes, &mem_cfg, &this->self_surface_cap_));
+    if (this->self_surface_ == nullptr)
+      this->self_surface_cap_ = 0;
+    // The thumbnail is never bigger than the picture itself.
+    const size_t thumb_bytes =
+        align_up(static_cast<uint32_t>(this->self_max_w_) * this->self_max_h_ * 2U, this->out_align_);
+    this->thumb_ = static_cast<uint8_t *>(heap_caps_aligned_calloc(
+        this->out_align_, 1, thumb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+    this->thumb_native_ = static_cast<uint8_t *>(heap_caps_aligned_calloc(
+        this->out_align_, 1, thumb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+    this->thumb_cap_ = thumb_bytes;
+    if (this->self_au_buf_ == nullptr || this->self_surface_ == nullptr || this->thumb_ == nullptr ||
+        this->thumb_native_ == nullptr) {
+      // Calls and the other side's picture still work without it.
+      ESP_LOGW(TAG, "Not enough PSRAM for the self view: turned off");
+      this->self_enabled_ = false;
+    }
+  }
+
   this->task_done_ = xSemaphoreCreateBinary();
   this->running_.store(true, std::memory_order_release);
   if (this->task_done_ == nullptr ||
@@ -123,8 +151,13 @@ void Tab5VideoView::dump_config() {
                 this->area_w_, this->area_h_, this->area_x_, this->area_y_, this->display_rotation_,
                 this->rx_width_, this->rx_height_, this->framerate_, this->max_decode_w_, this->max_decode_h_,
                 this->max_crop_ * 100.0f, (unsigned) this->no_video_timeout_ms_);
-  if (this->is_failed())
+  if (this->self_enabled_) {
+    ESP_LOGCONFIG(TAG, "  Self view: up to %ux%u at %u fps%s", this->self_max_w_, this->self_max_h_, this->self_fps_,
+                  this->self_mirror_ ? ", mirrored" : "");
+  }
+  if (this->is_failed()) {
     ESP_LOGCONFIG(TAG, "  FAILED to start (see the log above)");
+  }
 }
 
 void Tab5VideoView::on_shutdown() {
@@ -222,72 +255,125 @@ void Tab5VideoView::decode_task_trampoline_(void *arg) {
 }
 
 void Tab5VideoView::decode_task_() {
-  uint32_t last_error_log = 0;
   while (this->running_.load(std::memory_order_acquire)) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     if (!this->running_.load(std::memory_order_acquire))
       break;
-    // The picture waits in its slot until loop() has taken the last one.
-    if (this->au_state_.load(std::memory_order_acquire) != 1 ||
-        this->surface_state_.load(std::memory_order_acquire) != 0)
-      continue;
-    uint8_t expected = 1;
-    if (!this->au_state_.compare_exchange_strong(expected, 2, std::memory_order_acq_rel))
-      continue;
-
-    const uint32_t generation = this->au_generation_;
-    if (!this->active_.load(std::memory_order_acquire) ||
-        generation != this->generation_.load(std::memory_order_acquire)) {
-      this->au_state_.store(0, std::memory_order_release);
-      continue;
-    }
-
-    jpeg_decode_picture_info_t info{};
-    bool ok = jpeg_decoder_get_info(this->au_buf_, static_cast<uint32_t>(this->au_size_), &info) == ESP_OK &&
-              info.sample_method != JPEG_DOWN_SAMPLING_GRAY && info.width > 0 && info.height > 0 &&
-              info.width <= this->max_decode_w_ && info.height <= this->max_decode_h_;
-    uint32_t store_w = 0, store_h = 0, need = 0;
-    if (ok) {
-      // The decoder writes whole JPEG blocks.
-      store_w = align_up(info.width, info.sample_method == JPEG_DOWN_SAMPLING_YUV444 ? 8 : 16);
-      store_h = align_up(info.height, info.sample_method == JPEG_DOWN_SAMPLING_YUV420 ? 16 : 8);
-      need = store_w * store_h * 2U;
-      ok = need <= this->surface_cap_;
-    }
-    esp_err_t err = ESP_ERR_INVALID_SIZE;
-    uint32_t decoded = 0;
-    if (ok) {
-      this->surface_state_.store(1, std::memory_order_release);
-      err = jpeg_decoder_process(this->decoder_, &this->decode_cfg_, this->au_buf_,
-                                 static_cast<uint32_t>(this->au_size_), this->surface_, need, &decoded);
-    }
-    this->au_state_.store(0, std::memory_order_release);
-
-    if (ok && err == ESP_OK && decoded > 0 && this->active_.load(std::memory_order_acquire) &&
-        generation == this->generation_.load(std::memory_order_acquire)) {
-      this->surf_w_ = static_cast<uint16_t>(info.width);
-      this->surf_h_ = static_cast<uint16_t>(info.height);
-      this->surf_store_w_ = static_cast<uint16_t>(store_w);
-      this->surf_store_h_ = static_cast<uint16_t>(store_h);
-      this->surface_generation_ = generation;
-      this->frames_decoded_.fetch_add(1, std::memory_order_relaxed);
-      this->surface_state_.store(2, std::memory_order_release);
-      this->enable_loop_soon_any_context();
-    } else {
-      this->surface_state_.store(0, std::memory_order_release);
-      if (!ok || err != ESP_OK) {
-        this->decode_errors_.fetch_add(1, std::memory_order_relaxed);
-        const uint32_t now = millis();
-        if (now - last_error_log > 5000) {
-          last_error_log = now;
-          ESP_LOGW(TAG, "Could not decode a picture (%ux%u, %u bytes): %s", (unsigned) info.width,
-                   (unsigned) info.height, (unsigned) this->au_size_, ok ? esp_err_to_name(err) : "unsupported size");
-        }
-      }
-    }
+    // The other side's picture first, then this device's own.
+    this->decode_remote_();
+    this->decode_self_();
   }
   xSemaphoreGive(this->task_done_);
   vTaskSuspend(nullptr);
+}
+
+void Tab5VideoView::decode_remote_() {
+  static uint32_t last_error_log = 0;
+  // The picture waits in its slot until loop() has taken the last one.
+  if (this->au_state_.load(std::memory_order_acquire) != 1 ||
+      this->surface_state_.load(std::memory_order_acquire) != 0)
+    return;
+  uint8_t expected = 1;
+  if (!this->au_state_.compare_exchange_strong(expected, 2, std::memory_order_acq_rel))
+    return;
+
+  const uint32_t generation = this->au_generation_;
+  if (!this->active_.load(std::memory_order_acquire) ||
+      generation != this->generation_.load(std::memory_order_acquire)) {
+    this->au_state_.store(0, std::memory_order_release);
+    return;
+  }
+
+  jpeg_decode_picture_info_t info{};
+  bool ok = jpeg_decoder_get_info(this->au_buf_, static_cast<uint32_t>(this->au_size_), &info) == ESP_OK &&
+            info.sample_method != JPEG_DOWN_SAMPLING_GRAY && info.width > 0 && info.height > 0 &&
+            info.width <= this->max_decode_w_ && info.height <= this->max_decode_h_;
+  uint32_t store_w = 0, store_h = 0, need = 0;
+  if (ok) {
+    // The decoder writes whole JPEG blocks.
+    store_w = align_up(info.width, info.sample_method == JPEG_DOWN_SAMPLING_YUV444 ? 8 : 16);
+    store_h = align_up(info.height, info.sample_method == JPEG_DOWN_SAMPLING_YUV420 ? 16 : 8);
+    need = store_w * store_h * 2U;
+    ok = need <= this->surface_cap_;
+  }
+  esp_err_t err = ESP_ERR_INVALID_SIZE;
+  uint32_t decoded = 0;
+  if (ok) {
+    this->surface_state_.store(1, std::memory_order_release);
+    err = jpeg_decoder_process(this->decoder_, &this->decode_cfg_, this->au_buf_,
+                               static_cast<uint32_t>(this->au_size_), this->surface_, need, &decoded);
+  }
+  this->au_state_.store(0, std::memory_order_release);
+
+  if (ok && err == ESP_OK && decoded > 0 && this->active_.load(std::memory_order_acquire) &&
+      generation == this->generation_.load(std::memory_order_acquire)) {
+    this->surf_w_ = static_cast<uint16_t>(info.width);
+    this->surf_h_ = static_cast<uint16_t>(info.height);
+    this->surf_store_w_ = static_cast<uint16_t>(store_w);
+    this->surf_store_h_ = static_cast<uint16_t>(store_h);
+    this->surface_generation_ = generation;
+    this->frames_decoded_.fetch_add(1, std::memory_order_relaxed);
+    this->surface_state_.store(2, std::memory_order_release);
+    this->enable_loop_soon_any_context();
+  } else {
+    this->surface_state_.store(0, std::memory_order_release);
+    if (!ok || err != ESP_OK) {
+      this->decode_errors_.fetch_add(1, std::memory_order_relaxed);
+      const uint32_t now = millis();
+      if (now - last_error_log > 5000) {
+        last_error_log = now;
+        ESP_LOGW(TAG, "Could not decode a picture (%ux%u, %u bytes): %s", (unsigned) info.width,
+                 (unsigned) info.height, (unsigned) this->au_size_, ok ? esp_err_to_name(err) : "unsupported size");
+      }
+    }
+  }
+}
+
+void Tab5VideoView::decode_self_() {
+  static uint32_t last_error_log = 0;
+  if (!this->self_enabled_ || this->self_au_state_.load(std::memory_order_acquire) != 1 ||
+      this->self_surface_state_.load(std::memory_order_acquire) != 0)
+    return;
+  uint8_t expected = 1;
+  if (!this->self_au_state_.compare_exchange_strong(expected, 2, std::memory_order_acq_rel))
+    return;
+
+  jpeg_decode_picture_info_t info{};
+  bool ok = jpeg_decoder_get_info(this->self_au_buf_, static_cast<uint32_t>(this->self_au_size_), &info) == ESP_OK &&
+            info.sample_method != JPEG_DOWN_SAMPLING_GRAY && info.width > 0 && info.height > 0;
+  uint32_t store_w = 0, store_h = 0, need = 0;
+  if (ok) {
+    store_w = align_up(info.width, info.sample_method == JPEG_DOWN_SAMPLING_YUV444 ? 8 : 16);
+    store_h = align_up(info.height, info.sample_method == JPEG_DOWN_SAMPLING_YUV420 ? 16 : 8);
+    need = store_w * store_h * 2U;
+    ok = need <= this->self_surface_cap_ && static_cast<size_t>(info.width) * info.height * 2U <= this->thumb_cap_;
+  }
+  esp_err_t err = ESP_ERR_INVALID_SIZE;
+  uint32_t decoded = 0;
+  if (ok) {
+    this->self_surface_state_.store(1, std::memory_order_release);
+    err = jpeg_decoder_process(this->decoder_, &this->decode_cfg_, this->self_au_buf_,
+                               static_cast<uint32_t>(this->self_au_size_), this->self_surface_, need, &decoded);
+  }
+  this->self_au_state_.store(0, std::memory_order_release);
+  if (ok && err == ESP_OK && decoded > 0 && this->self_visible_.load(std::memory_order_acquire)) {
+    this->self_w_px_ = static_cast<uint16_t>(info.width);
+    this->self_h_px_ = static_cast<uint16_t>(info.height);
+    this->self_store_w_ = static_cast<uint16_t>(store_w);
+    this->self_store_h_ = static_cast<uint16_t>(store_h);
+    this->self_surface_state_.store(2, std::memory_order_release);
+    this->enable_loop_soon_any_context();
+    return;
+  }
+  this->self_surface_state_.store(0, std::memory_order_release);
+  if (!ok || err != ESP_OK) {
+    const uint32_t now = millis();
+    if (now - last_error_log > 5000) {
+      last_error_log = now;
+      ESP_LOGW(TAG, "Could not decode own camera picture (%ux%u, %u bytes): %s", (unsigned) info.width,
+               (unsigned) info.height, (unsigned) this->self_au_size_, ok ? esp_err_to_name(err) : "too big");
+    }
+  }
 }
 
 void Tab5VideoView::loop() {
@@ -317,6 +403,181 @@ void Tab5VideoView::loop() {
       this->first_frame_trigger_.trigger();
     }
   }
+
+  // A new own camera picture: scale it once, then draw it.
+  if (this->self_surface_state_.load(std::memory_order_acquire) == 2) {
+    if (this->self_visible_.load(std::memory_order_acquire) && this->render_thumb_())
+      this->self_redraw_ = true;
+    this->self_surface_state_.store(0, std::memory_order_release);
+    if (this->task_ != nullptr)
+      xTaskNotifyGive(this->task_);
+  }
+  if (this->self_redraw_) {
+    this->self_redraw_ = false;
+    this->draw_self_();
+  }
+}
+
+void Tab5VideoView::set_self_view(int x, int y, int w, int h) {
+  if (!this->self_enabled_)
+    return;
+  if (w <= 0 || h <= 0) {
+    this->self_rx_ = this->self_ry_ = this->self_rw_ = this->self_rh_ = 0;
+    this->self_visible_.store(false, std::memory_order_release);
+    this->thumb_valid_ = false;
+    this->self_redraw_ = false;
+    return;
+  }
+  if (w != this->self_rw_ || h != this->self_rh_)
+    this->thumb_valid_ = false;  // made for another size: wait for the next picture
+  if (!this->self_visible_.load(std::memory_order_acquire))
+    this->self_cadence_.reset(this->self_fps_);
+  this->self_rx_ = x;
+  this->self_ry_ = y;
+  this->self_rw_ = w;
+  this->self_rh_ = h;
+  this->self_visible_.store(true, std::memory_order_release);
+  // The screen update that called this may cover the picture: draw it again
+  // once that update is done.
+  this->self_redraw_ = true;
+  this->enable_loop();
+}
+
+void Tab5VideoView::offer_self_frame(const voip_stack::EncodedVideoAccessUnit &access_unit) {
+  // Runs on the camera's task: copy and return quickly.
+  if (!this->self_enabled_ || !this->self_visible_.load(std::memory_order_acquire) || access_unit.data == nullptr ||
+      access_unit.size == 0 || access_unit.size > this->self_au_cap_)
+    return;
+  if (!this->self_cadence_.accept(access_unit.timestamp_90khz))
+    return;
+  uint8_t expected = 0;
+  if (!this->self_au_state_.compare_exchange_strong(expected, 2, std::memory_order_acq_rel))
+    return;  // still busy with the last one: skip this picture
+  std::memcpy(this->self_au_buf_, access_unit.data, access_unit.size);
+  this->self_au_size_ = access_unit.size;
+  this->self_au_state_.store(1, std::memory_order_release);
+  if (this->task_ != nullptr)
+    xTaskNotifyGive(this->task_);
+}
+
+bool Tab5VideoView::render_thumb_() {
+  const int cw = this->self_w_px_, ch = this->self_h_px_;
+  const int rw = this->self_rw_, rh = this->self_rh_;
+  if (cw <= 0 || ch <= 0 || rw <= 0 || rh <= 0)
+    return false;
+  // Fit the whole picture in the rectangle (never bigger than it is).
+  const int units = std::min({kScaleUnits, rw * kScaleUnits / cw, rh * kScaleUnits / ch});
+  if (units < 1)
+    return false;
+  const int tw = cw * units / kScaleUnits, th = ch * units / kScaleUnits;
+  if (tw <= 0 || th <= 0 || static_cast<size_t>(tw) * th * 2U > this->thumb_cap_)
+    return false;
+  // Scale and mirror without turning: with no rotation the mirror is plainly
+  // left-right. The turn for the panel is a second step (draw_self_ and
+  // composite_self_).
+  ppa_srm_oper_config_t srm{};
+  srm.in.buffer = this->self_surface_;
+  srm.in.pic_w = this->self_store_w_;
+  srm.in.pic_h = this->self_store_h_;
+  srm.in.block_w = cw;
+  srm.in.block_h = ch;
+  srm.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  srm.out.buffer = this->thumb_;
+  srm.out.buffer_size = this->thumb_cap_;
+  srm.out.pic_w = tw;
+  srm.out.pic_h = th;
+  srm.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  srm.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+  srm.scale_x = static_cast<float>(units) / kScaleUnits;
+  srm.scale_y = srm.scale_x;
+  srm.mirror_x = this->self_mirror_;
+  srm.mode = PPA_TRANS_MODE_BLOCKING;
+  const esp_err_t err = ppa_do_scale_rotate_mirror(this->ppa_, &srm);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Self view scaling failed: %s", esp_err_to_name(err));
+    this->thumb_valid_ = false;
+    return false;
+  }
+  this->thumb_w_ = tw;
+  this->thumb_h_ = th;
+  this->thumb_valid_ = true;
+  return true;
+}
+
+bool Tab5VideoView::thumb_place_(int *lx, int *ly) const {
+  if (!this->thumb_valid_ || this->self_rw_ <= 0 || this->thumb_w_ > this->self_rw_ ||
+      this->thumb_h_ > this->self_rh_)
+    return false;
+  *lx = this->self_rx_ + (this->self_rw_ - this->thumb_w_) / 2;
+  *ly = this->self_ry_ + (this->self_rh_ - this->thumb_h_) / 2;
+  return true;
+}
+
+bool Tab5VideoView::draw_self_() {
+  int lx, ly;
+  if (!this->self_visible_.load(std::memory_order_acquire) || !this->thumb_place_(&lx, &ly))
+    return false;
+  int nx, ny, nw, nh;
+  ppa_srm_rotation_angle_t angle;
+  this->map_to_native_(lx, ly, this->thumb_w_, this->thumb_h_, &nx, &ny, &nw, &nh, &angle);
+  if (nx < 0 || ny < 0 || nx + nw > this->display_->get_native_width() ||
+      ny + nh > this->display_->get_native_height())
+    return false;
+  ppa_srm_oper_config_t srm{};
+  srm.in.buffer = this->thumb_;
+  srm.in.pic_w = this->thumb_w_;
+  srm.in.pic_h = this->thumb_h_;
+  srm.in.block_w = this->thumb_w_;
+  srm.in.block_h = this->thumb_h_;
+  srm.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  srm.out.buffer = this->thumb_native_;
+  srm.out.buffer_size = this->thumb_cap_;
+  srm.out.pic_w = nw;
+  srm.out.pic_h = nh;
+  srm.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  srm.rotation_angle = angle;
+  srm.scale_x = 1.0f;
+  srm.scale_y = 1.0f;
+  srm.mode = PPA_TRANS_MODE_BLOCKING;
+  if (ppa_do_scale_rotate_mirror(this->ppa_, &srm) != ESP_OK)
+    return false;
+  this->display_->draw_pixels_at(nx, ny, nw, nh, this->thumb_native_, display::COLOR_ORDER_RGB,
+                                 display::COLOR_BITNESS_565, false, 0, 0, 0);
+  return true;
+}
+
+void Tab5VideoView::composite_self_(int pic_nx, int pic_ny, int pic_nw, int pic_nh) {
+  // Put the own picture into the other side's picture before it goes to the
+  // panel, so the corner never flickers.
+  int lx, ly;
+  if (!this->self_visible_.load(std::memory_order_acquire) || !this->thumb_place_(&lx, &ly))
+    return;
+  int nx, ny, nw, nh;
+  ppa_srm_rotation_angle_t angle;
+  this->map_to_native_(lx, ly, this->thumb_w_, this->thumb_h_, &nx, &ny, &nw, &nh, &angle);
+  const int ox = nx - pic_nx, oy = ny - pic_ny;
+  if (ox < 0 || oy < 0 || ox + nw > pic_nw || oy + nh > pic_nh)
+    return;  // not inside the picture: loop() draws it on its own
+  ppa_srm_oper_config_t srm{};
+  srm.in.buffer = this->thumb_;
+  srm.in.pic_w = this->thumb_w_;
+  srm.in.pic_h = this->thumb_h_;
+  srm.in.block_w = this->thumb_w_;
+  srm.in.block_h = this->thumb_h_;
+  srm.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  srm.out.buffer = this->out_buf_;
+  srm.out.buffer_size = this->out_cap_;
+  srm.out.pic_w = pic_nw;
+  srm.out.pic_h = pic_nh;
+  srm.out.block_offset_x = ox;
+  srm.out.block_offset_y = oy;
+  srm.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  srm.rotation_angle = angle;
+  srm.scale_x = 1.0f;
+  srm.scale_y = 1.0f;
+  srm.mode = PPA_TRANS_MODE_BLOCKING;
+  if (ppa_do_scale_rotate_mirror(this->ppa_, &srm) != ESP_OK)
+    this->self_redraw_ = true;
 }
 
 void Tab5VideoView::check_stale_() {
@@ -470,6 +731,7 @@ bool Tab5VideoView::present_() {
     ESP_LOGW(TAG, "PPA scale/rotate failed: %s", esp_err_to_name(err));
     return false;
   }
+  this->composite_self_(nx, ny, nw, nh);
   this->display_->draw_pixels_at(nx, ny, nw, nh, this->out_buf_, display::COLOR_ORDER_RGB, display::COLOR_BITNESS_565,
                                  false, 0, 0, 0);
   return true;
@@ -541,13 +803,24 @@ bool Tab5CameraGate::set_enabled(bool enabled) {
     ok = false;  // no call with video: nothing to send to
   } else {
     if (!this->source_running_)
-      this->source_running_ = this->source_->start_video(this->callback_, this->callback_ctx_, this->capability_);
+      this->source_running_ = this->source_->start_video(Tab5CameraGate::forward_, this, this->capability_);
     ok = this->source_running_;
     this->enabled_.store(ok, std::memory_order_release);
   }
   xSemaphoreGive(this->mutex_);
   ESP_LOGI(TAG, "Camera %s%s", enabled ? "on" : "off", ok ? "" : " refused (no video on this call)");
   return ok;
+}
+
+void Tab5CameraGate::forward_(void *ctx, const voip_stack::EncodedVideoAccessUnit &access_unit) {
+  // Camera task. The camera source stops calling this before stop_video()
+  // or set_enabled(false) clear the callback, so no lock is needed here.
+  auto *gate = static_cast<Tab5CameraGate *>(ctx);
+  const auto callback = gate->callback_;
+  if (callback != nullptr)
+    callback(gate->callback_ctx_, access_unit);
+  if (gate->self_view_ != nullptr)
+    gate->self_view_->offer_self_frame(access_unit);
 }
 
 void Tab5CameraGate::request_key_frame() {

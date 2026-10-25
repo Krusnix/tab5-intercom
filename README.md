@@ -43,6 +43,14 @@ With the gate, VoIP Stack always agrees on video both ways, while the camera
 itself stays off at the start of every call. `set_enabled(true)` starts it
 during a call; it stops again by itself when the call's video ends.
 
+The gate also hands every picture it sends to the view's **self view**: the
+device's own picture, scaled down and mirrored (like a mirror; the other side
+sees it the right way round). The display lambda says where it goes with
+`id(remote_video).set_self_view(x, y, w, h)` on every drawing (0 width hides
+it); it is drawn again right after each screen update, and over the other
+side's picture it is put into that picture before it reaches the panel, so
+it never flickers. Turn it off with `self_view: false`.
+
 ```yaml
 esp_jpeg_video_source:
   id: camera_video
@@ -67,6 +75,11 @@ tab5_video:
   camera:
     id: camera_gate
     source_id: camera_video
+    # self_view: true          # own picture where set_self_view() says
+    # self_view_mirror: true
+    # self_view_framerate: 10
+    # width: 640               # the camera's call picture size
+    # height: 360
   on_first_frame:
     - component.update: main_display
   on_video_ended:
@@ -86,13 +99,15 @@ voip_stack:
 ```
 
 In lambdas: `id(remote_video).has_frame()`, `is_receiving()`,
-`frames_shown()`, `decode_errors()`, and `id(camera_gate).set_enabled(bool)`,
+`frames_shown()`, `decode_errors()`, `set_self_view(x, y, w, h)`,
+`get_self_view(&x, &y, &w, &h)`, and `id(camera_gate).set_enabled(bool)`,
 `is_enabled()`, `is_available()`.
 
 Note for the display lambda (built-in `mipi_dsi`): that driver only sends
 pixels that changed in its own buffer. After the picture goes away, mark the
 whole screen as changed before drawing (for example by drawing two corner
-pixels in two different colours), or parts of the last picture stay.
+pixels in two different colours), or parts of the last picture stay. The
+same goes for the self view's old rectangle when it moves or is hidden.
 
 Built against ESPHome 2026.10.0, VoIP Stack v2026.11.0-dev and
 esphome-esp-video-camera v2026.10.0-dev for the M5Stack Tab5.

@@ -62,6 +62,15 @@ class Tab5VideoView : public Component, public voip_stack::EncodedVideoSink {
   void set_max_crop(float share) { this->max_crop_ = share; }
   void set_swap_red_blue(bool swap) { this->swap_rb_ = swap; }
   void set_no_video_timeout(uint32_t ms) { this->no_video_timeout_ms_ = ms; }
+  /// Self view: this device's own camera pictures, drawn small. Turned on
+  /// by the camera: block (it sends each picture to offer_self_frame()).
+  void set_self_view_source_size(uint16_t w, uint16_t h) {
+    this->self_enabled_ = true;
+    this->self_max_w_ = w;
+    this->self_max_h_ = h;
+  }
+  void set_self_view_mirror(bool mirror) { this->self_mirror_ = mirror; }
+  void set_self_view_framerate(uint8_t fps) { this->self_fps_ = fps; }
 
   Trigger<> *get_first_frame_trigger() { return &this->first_frame_trigger_; }
   Trigger<> *get_video_ended_trigger() { return &this->video_ended_trigger_; }
@@ -87,10 +96,32 @@ class Tab5VideoView : public Component, public voip_stack::EncodedVideoSink {
   void set_paused(bool paused);
   bool is_paused() const { return this->paused_.load(std::memory_order_acquire); }
 
+  /// Where to draw this device's own picture (screen coordinates); a width
+  /// or height of 0 hides it. Call it from the display lambda on every
+  /// drawing: the picture is drawn again right after the screen update, so
+  /// the lambda can draw anything under it. The picture keeps its shape and
+  /// is centred in the rectangle.
+  void set_self_view(int x, int y, int w, int h);
+  /// The rectangle last given to set_self_view().
+  void get_self_view(int *x, int *y, int *w, int *h) const {
+    *x = this->self_rx_;
+    *y = this->self_ry_;
+    *w = this->self_rw_;
+    *h = this->self_rh_;
+  }
+  /// Called by Tab5CameraGate, on the camera's task, with each picture sent.
+  void offer_self_frame(const voip_stack::EncodedVideoAccessUnit &access_unit);
+
  protected:
   static void decode_task_trampoline_(void *arg);
   void decode_task_();
+  void decode_remote_();
+  void decode_self_();
   bool present_();
+  bool render_thumb_();
+  bool draw_self_();
+  void composite_self_(int pic_nx, int pic_ny, int pic_nw, int pic_nh);
+  bool thumb_place_(int *lx, int *ly) const;
   bool clear_area_();
   void check_stale_();
   void end_presentation_();
@@ -132,6 +163,32 @@ class Tab5VideoView : public Component, public voip_stack::EncodedVideoSink {
   size_t out_cap_{0};
   size_t out_align_{64};
 
+  // Self view. Rectangle and thumbnail belong to the main loop; the camera
+  // task only reads self_visible_.
+  bool self_enabled_{false};
+  bool self_mirror_{true};
+  uint8_t self_fps_{10};
+  uint16_t self_max_w_{640}, self_max_h_{360};
+  int self_rx_{0}, self_ry_{0}, self_rw_{0}, self_rh_{0};
+  std::atomic<bool> self_visible_{false};
+  bool self_redraw_{false};
+  voip_stack::RtpFrameCadence90k self_cadence_;
+  uint8_t *self_au_buf_{nullptr};
+  size_t self_au_cap_{0};
+  size_t self_au_size_{0};
+  std::atomic<uint8_t> self_au_state_{0};  // 0 free, 1 full, 2 owned
+  uint8_t *self_surface_{nullptr};
+  size_t self_surface_cap_{0};
+  uint16_t self_w_px_{0}, self_h_px_{0}, self_store_w_{0}, self_store_h_{0};
+  std::atomic<uint8_t> self_surface_state_{0};  // 0 free, 1 decoding, 2 ready
+  // Scaled and mirrored picture (screen orientation), and the same turned
+  // for the panel.
+  uint8_t *thumb_{nullptr};
+  uint8_t *thumb_native_{nullptr};
+  size_t thumb_cap_{0};
+  int thumb_w_{0}, thumb_h_{0};
+  bool thumb_valid_{false};
+
   // What is on the screen now (to know when the area must be cleared).
   int shown_lx_{-1}, shown_ly_{-1}, shown_lw_{0}, shown_lh_{0};
   bool area_clean_{false};
@@ -170,6 +227,8 @@ class Tab5CameraGate : public voip_stack::EncodedVideoSource {
  public:
   Tab5CameraGate();
   void set_source(voip_stack::EncodedVideoSource *source) { this->source_ = source; }
+  /// Also hand every picture sent to this view's self view.
+  void set_self_view(Tab5VideoView *view) { this->self_view_ = view; }
 
   /// Open (true) or close (false) the gate. Opening only works while a
   /// call's video is set up; returns false otherwise.
@@ -188,7 +247,10 @@ class Tab5CameraGate : public voip_stack::EncodedVideoSource {
   void request_key_frame() override;
 
  protected:
+  static void forward_(void *ctx, const voip_stack::EncodedVideoAccessUnit &access_unit);
+
   voip_stack::EncodedVideoSource *source_{nullptr};
+  Tab5VideoView *self_view_{nullptr};
   SemaphoreHandle_t mutex_{nullptr};
   StaticSemaphore_t mutex_storage_{};
   voip_stack::EncodedVideoAccessUnitCallback callback_{nullptr};

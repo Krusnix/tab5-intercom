@@ -40,6 +40,9 @@ CONF_SWAP_RED_BLUE = "swap_red_blue"
 CONF_ON_FIRST_FRAME = "on_first_frame"
 CONF_ON_VIDEO_ENDED = "on_video_ended"
 CONF_CAMERA = "camera"
+CONF_SELF_VIEW = "self_view"
+CONF_SELF_VIEW_MIRROR = "self_view_mirror"
+CONF_SELF_VIEW_FRAMERATE = "self_view_framerate"
 CONF_NO_VIDEO_TIMEOUT = "no_video_timeout"
 
 tab5_video_ns = cg.esphome_ns.namespace("tab5_video")
@@ -55,6 +58,17 @@ CAMERA_SCHEMA = cv.Schema(
         cv.GenerateID(): cv.declare_id(Tab5CameraGate),
         # The camera's own VoIP Stack source (esp_jpeg_video_source).
         cv.Required(CONF_SOURCE_ID): cv.use_id(voip_stack.EncodedVideoSource),
+        # Self view: this device's own picture, drawn small where the display
+        # lambda puts it with set_self_view(). Only while the camera is on.
+        cv.Optional(CONF_SELF_VIEW, default=True): cv.boolean,
+        # Show it like a mirror (the other side sees it the right way round).
+        cv.Optional(CONF_SELF_VIEW_MIRROR, default=True): cv.boolean,
+        cv.Optional(CONF_SELF_VIEW_FRAMERATE, default=10): cv.int_range(
+            min=1, max=30
+        ),
+        # Size of the camera's call pictures (as in esp_jpeg_video_source).
+        cv.Optional(CONF_WIDTH, default=640): cv.int_range(min=64, max=1280),
+        cv.Optional(CONF_HEIGHT, default=360): cv.int_range(min=64, max=800),
     }
 )
 
@@ -141,6 +155,13 @@ async def to_code(config):
         gate = cg.new_Pvariable(camera[CONF_ID])
         source = await cg.get_variable(camera[CONF_SOURCE_ID])
         cg.add(gate.set_source(source))
+        if camera[CONF_SELF_VIEW]:
+            cg.add(
+                var.set_self_view_source_size(camera[CONF_WIDTH], camera[CONF_HEIGHT])
+            )
+            cg.add(var.set_self_view_mirror(camera[CONF_SELF_VIEW_MIRROR]))
+            cg.add(var.set_self_view_framerate(camera[CONF_SELF_VIEW_FRAMERATE]))
+            cg.add(gate.set_self_view(var))
 
     if on_first := config.get(CONF_ON_FIRST_FRAME):
         await automation.build_automation(
