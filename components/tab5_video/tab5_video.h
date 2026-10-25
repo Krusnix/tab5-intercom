@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -34,6 +35,9 @@ namespace esphome::tab5_video {
 ///  - loop() (the ESPHome main task) scales and rotates it with the PPA and
 ///    writes it to the panel. All panel writes happen on the main task, the
 ///    same task that runs the display lambda, so the two never overlap.
+///  - still pictures (show_picture()) are fetched over plain HTTP by a
+///    second small task, then take the same decode and display path while
+///    no call video is set up.
 class Tab5VideoView : public Component, public voip_stack::EncodedVideoSink {
  public:
   void setup() override;
@@ -74,6 +78,9 @@ class Tab5VideoView : public Component, public voip_stack::EncodedVideoSink {
 
   Trigger<> *get_first_frame_trigger() { return &this->first_frame_trigger_; }
   Trigger<> *get_video_ended_trigger() { return &this->video_ended_trigger_; }
+  /// Fires on the main loop when the still picture changes on the screen,
+  /// when fetching it starts or stops failing, and when it goes away.
+  Trigger<> *get_picture_trigger() { return &this->picture_trigger_; }
 
   // voip_stack::EncodedVideoSink
   voip_stack::VideoCapability get_receive_video_capability() const override;
@@ -112,6 +119,27 @@ class Tab5VideoView : public Component, public voip_stack::EncodedVideoSink {
   /// Called by Tab5CameraGate, on the camera's task, with each picture sent.
   void offer_self_frame(const voip_stack::EncodedVideoAccessUnit &access_unit);
 
+  // ---- Still pictures (for example a doorbell camera) ----
+  /// Fetch one JPEG picture from an http:// address and show it in the area,
+  /// as long as no call video is set up. Call it again to look for a newer
+  /// picture: the screen only changes when the picture did. Main loop only.
+  /// Returns false (nothing done) while a call's video owns the area.
+  bool show_picture(const std::string &url);
+  /// Take the still picture off and stop fetching. A call's video starting
+  /// does this too.
+  void hide_picture();
+  /// True from show_picture() until hide_picture().
+  bool picture_mode() const { return this->picture_on_.load(std::memory_order_acquire); }
+  /// True while a still picture is on the screen.
+  bool has_picture() const { return this->picture_visible_.load(std::memory_order_acquire); }
+  /// What went wrong with the last fetch, or "" when it worked.
+  std::string picture_error() const;
+  /// millis() when the still picture on the screen last changed, 0 = none.
+  uint32_t picture_changed_ms() const { return this->picture_changed_ms_; }
+  /// Size of the last still picture shown.
+  int picture_width() const { return this->pic_shown_w_; }
+  int picture_height() const { return this->pic_shown_h_; }
+
  protected:
   static void decode_task_trampoline_(void *arg);
   void decode_task_();
@@ -124,6 +152,12 @@ class Tab5VideoView : public Component, public voip_stack::EncodedVideoSink {
   bool thumb_place_(int *lx, int *ly) const;
   bool clear_area_();
   void check_stale_();
+  bool start_picture_task_();
+  static void fetch_task_trampoline_(void *arg);
+  void fetch_task_();
+  void fetch_picture_(const std::string &url, uint32_t generation);
+  void decode_picture_();
+  void set_picture_error_(uint8_t code, int32_t detail);
   void end_presentation_();
   void map_to_native_(int lx, int ly, int lw, int lh, int *nx, int *ny, int *nw,
                       int *nh, ppa_srm_rotation_angle_t *angle) const;
@@ -210,8 +244,37 @@ class Tab5VideoView : public Component, public voip_stack::EncodedVideoSink {
   uint8_t negotiated_fps_{10};
   bool logged_geometry_{false};
 
+  // Still pictures. The address is guarded by pic_mutex_; the fetched
+  // picture slot works like au_state_ (0 free, 1 full, 2 owned).
+  SemaphoreHandle_t pic_mutex_{nullptr};
+  StaticSemaphore_t pic_mutex_storage_{};
+  std::string pic_url_;
+  TaskHandle_t fetch_handle_{nullptr};
+  uint8_t *pic_buf_{nullptr};
+  size_t pic_cap_{0};
+  size_t pic_size_{0};
+  uint32_t pic_generation_{0};
+  uint32_t pic_crc_{0};
+  std::atomic<uint8_t> pic_state_{0};
+  std::atomic<bool> picture_on_{false};
+  std::atomic<bool> picture_visible_{false};
+  std::atomic<bool> picture_ended_pending_{false};
+  std::atomic<bool> picture_note_pending_{false};
+  // Checksum of the picture on the screen (0 = none), so an unchanged
+  // picture is not decoded and drawn again.
+  std::atomic<uint32_t> shown_crc_{0};
+  std::atomic<uint8_t> pic_err_{0};
+  std::atomic<int32_t> pic_err_detail_{0};
+  uint32_t picture_changed_ms_{0};
+  int pic_shown_w_{0}, pic_shown_h_{0};
+  // What the decoded surface holds: a still picture (and its checksum) or
+  // a call picture.
+  bool surface_is_picture_{false};
+  uint32_t surface_crc_{0};
+
   Trigger<> first_frame_trigger_;
   Trigger<> video_ended_trigger_;
+  Trigger<> picture_trigger_;
 };
 
 /// Stands between the camera's JPEG source and voip_stack, so the camera can

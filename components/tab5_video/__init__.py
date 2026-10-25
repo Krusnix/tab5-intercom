@@ -9,6 +9,10 @@ display lambda keeps drawing everything else.
 The optional camera: block adds a gate in front of the camera's JPEG source
 (give it to voip_stack as video.source). It keeps the camera off at the start
 of every call and lets it be switched on and off during the call.
+
+Outside calls the same rectangle can show still JPEG pictures fetched over
+plain HTTP (for example a Home Assistant camera's latest picture) with
+show_picture(url) / hide_picture() from a lambda.
 """
 
 import esphome.codegen as cg
@@ -39,6 +43,7 @@ CONF_MAX_CROP = "max_crop"
 CONF_SWAP_RED_BLUE = "swap_red_blue"
 CONF_ON_FIRST_FRAME = "on_first_frame"
 CONF_ON_VIDEO_ENDED = "on_video_ended"
+CONF_ON_PICTURE = "on_picture"
 CONF_CAMERA = "camera"
 CONF_SELF_VIEW = "self_view"
 CONF_SELF_VIEW_MIRROR = "self_view_mirror"
@@ -119,6 +124,11 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_VIDEO_ENDED): automation.validate_automation(
                 single=True
             ),
+            # A still picture (show_picture) changed on the screen, went
+            # away, or fetching it started or stopped failing.
+            cv.Optional(CONF_ON_PICTURE): automation.validate_automation(
+                single=True
+            ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
@@ -170,4 +180,8 @@ async def to_code(config):
     if on_ended := config.get(CONF_ON_VIDEO_ENDED):
         await automation.build_automation(
             var.get_video_ended_trigger(), [], on_ended
+        )
+    if on_picture := config.get(CONF_ON_PICTURE):
+        await automation.build_automation(
+            var.get_picture_trigger(), [], on_picture
         )

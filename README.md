@@ -103,6 +103,37 @@ In lambdas: `id(remote_video).has_frame()`, `is_receiving()`,
 `get_self_view(&x, &y, &w, &h)`, and `id(camera_gate).set_enabled(bool)`,
 `is_enabled()`, `is_available()`.
 
+#### Still pictures (doorbell camera)
+
+Outside calls, the same rectangle can show a still JPEG picture fetched over
+plain HTTP, for example a Home Assistant camera's latest picture:
+
+```yaml
+tab5_video:
+  # ...
+  on_picture:              # picture changed, went away, or fetching failed
+    - component.update: main_display
+```
+
+```cpp
+// From a lambda on the main loop; call again every few seconds to pick up
+// a newer picture (the screen only changes when the picture did).
+id(remote_video).show_picture("http://192.168.4.114/api/camera_proxy/camera.front_door?token=...&width=960&height=540");
+id(remote_video).hide_picture();
+```
+
+- A small task of its own (stack in PSRAM) fetches the picture with a plain
+  HTTP/1.0 GET (no https), into a 1 MB PSRAM buffer made on first use. The
+  same hardware decoder and PPA path as call video put it on the screen.
+- An unchanged picture (same checksum) is not decoded or drawn again.
+- A call's video always wins: `show_picture()` refuses while one is set up,
+  and a call's video starting turns the still picture off.
+- `has_picture()`, `picture_mode()`, `picture_error()` (a short sentence, or
+  `""`), `picture_changed_ms()`, `picture_width()`, `picture_height()`.
+- Pictures bigger than `max_decode_width` x `max_decode_height` are refused
+  (Home Assistant's camera proxy shrinks them when given `width` and
+  `height`). Baseline JPEG only (the P4 hardware decoder).
+
 Note for the display lambda (built-in `mipi_dsi`): that driver only sends
 pixels that changed in its own buffer. After the picture goes away, mark the
 whole screen as changed before drawing (for example by drawing two corner
