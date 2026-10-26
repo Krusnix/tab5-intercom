@@ -8,11 +8,12 @@ the components in this repository with:
 
 ```yaml
 external_components:
-  - source: github://Krusnix/tab5-intercom@<tag>
-    components: [tab5_video]
+  - source: github://Krusnix/tab5-intercom@<commit>
+    components: [tab5_video, tab5_broadcast]
 ```
 
-Always pin a tag, so a later change here never alters a build by surprise.
+Always pin a commit (or tag), so a later change here never alters a build
+by surprise.
 
 ## Components
 
@@ -142,3 +143,63 @@ same goes for the self view's old rectangle when it moves or is hidden.
 
 Built against ESPHome 2026.10.0, VoIP Stack v2026.11.0-dev and
 esphome-esp-video-camera v2026.10.0-dev for the M5Stack Tab5.
+
+### `tab5_broadcast`
+
+Broadcasts between the two Tab5s: one Tab5 records a few seconds of voice,
+the other one plays it right away. Two parts:
+
+**The clip server** (`tab5_broadcast:`) keeps this Tab5's newest recording
+and serves it as a WAV file on a small HTTP server of its own (ESP-IDF
+`esp_http_server`, plain http, home network only). The other Tab5 plays it
+straight from there with its `speaker_source` media player and an
+`audio_http` media source, so the audio never goes through Home Assistant;
+Home Assistant only passes the address on (an ESPHome API action).
+
+```yaml
+tab5_broadcast:
+  id: bc_server
+  port: 8099               # default
+```
+
+```cpp
+// 16-bit mono samples (for example the microphone's, collected in PSRAM).
+// Returns "http://<ip>:8099/broadcast/<id>.wav", or "" (no IPv4 address,
+// no memory). Only the newest clip is kept; an older address answers 404.
+std::string url = id(bc_server).publish_clip(samples, count, 16000);
+```
+
+- The clip is copied into PSRAM with a 44-byte WAV header, and a 10 ms fade
+  in and out (no click at either end).
+- Each clip gets a random id in its address, so an old address never plays
+  a newer recording.
+- At most two clients at a time; the server's task stack is in PSRAM. If
+  the network isn't up yet it tries again every 10 s.
+- `get_clip_url()`, `clear_clip()`, `get_fetch_count()`, `is_running()`.
+
+**The pass-through speaker** (`speaker: - platform: tab5_broadcast`) goes
+between a media player and the rest of its speaker chain. A media player sets
+the volume and mute of its speaker, and the mixer and resampler speakers pass
+those down to the hardware speaker, where they would change the volume of
+calls and the ring too. This speaker passes the audio through unchanged and
+keeps volume and mute to itself; set how loud the media player plays some
+other way, for example with the mixer source's ducking
+(`id(mixer_input)->apply_ducking(db, 0)`).
+
+```yaml
+speaker:
+  - platform: tab5_broadcast
+    id: bcast_out
+    output_speaker: bcast_resampler   # resampler -> mixer source -> hardware
+
+media_player:
+  - platform: speaker_source
+    media_pipeline:
+      speaker: bcast_out
+      # ...
+```
+
+`id(bcast_out).get_played_bytes()` / `reset_played_bytes()` count the audio
+that went through, so a lambda can tell whether a playback made any sound.
+
+Built against ESPHome 2026.10.0 (ESP-IDF 5.5) for the M5Stack Tab5.
