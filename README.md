@@ -251,8 +251,75 @@ id(sd_card).get_test_result(); // "", "Testing...", "OK: writes 9.1 MB/s,
 `refresh_space()` measures the free space again, and
 `report_card_error(what)` marks the card as gone until the next `check()`.
 
+#### Saving a download, and the files in a folder
+
+The card's task can save a plain `http://` download (one at a time), and
+keep a list of the files in one folder. Both are for voicemails (the other
+Tab5's recording, fetched from its `tab5_broadcast` clip server), but take
+any file.
+
+```cpp
+// Downloads into /sdcard/voicemail/x.wav (first as x.wav.part, renamed when
+// complete; folders are made). false: no card, or a save is running.
+id(sd_card).start_save("http://192.168.4.50:8099/broadcast/1a2b.wav",
+                       "voicemail/x.wav", 3 * 1024 * 1024);
+id(sd_card).get_save_state();  // 0 none, 1 running, 2 done, 3 failed
+id(sd_card).get_save_error();  // "can't reach 192.168.4.50", "too big" ...
+id(sd_card).set_gentle(true);  // during a call: a 40 ms pause after each
+                               // 32 KB written, so Wi-Fi keeps the SD host
+
+id(sd_card).scan_folder("voicemail");  // list it (made if missing)
+id(sd_card).get_files();               // names, Z to A (newest first for
+                                       // names that start with the date)
+id(sd_card).get_files_version();       // goes up with each new list
+id(sd_card).remove_file("voicemail/x.wav");
+id(sd_card).rename_file("voicemail/x.wav", "voicemail/y.wav");
+```
+
+A finished save, `remove_file()` and `rename_file()` list the folder again, then
+`on_change` fires. `.part` files, folders and hidden files aren't listed.
+
+#### Playing WAV files from the card
+
+A media source for a `speaker_source` media player:
+`sdcard://voicemail/x.wav` plays `/sdcard/voicemail/x.wav`. Plain 16-bit
+PCM WAV only (mono or stereo, 8 to 48 kHz), read in 8 KB pieces on a task
+of its own with its stack in PSRAM. Pause, resume and stop work as for
+other sources.
+
+```yaml
+media_source:
+  - platform: tab5_sdcard
+    id: vm_source
+
+media_player:
+  - platform: speaker_source
+    media_pipeline:
+      sources: [http_source, vm_source]
+      # ...
+```
+
+#### Voicemail file names
+
+`voicemail.h` has helpers for files named
+`20261026-224301_Mom_23s_new.wav` (when, who, how long, and `_new` until
+played), usable in lambdas:
+
+```cpp
+auto vm = tab5_sdcard::parse_voicemail(name);  // vm.from, vm.year .. vm.minute,
+                                               // vm.seconds, vm.is_new, vm.key
+tab5_sdcard::voicemail_file_name(id(ha_time).now(), "Mom", 23);
+tab5_sdcard::voicemail_heard_name(name);       // without "_new"
+tab5_sdcard::voicemail_when(vm, now, false);   // "Today 2:41 PM", "Oct 26, 2:41 PM"
+tab5_sdcard::voicemail_time(vm, false);        // "2:41 PM"
+tab5_sdcard::voicemail_length(23);             // "0:23"
+```
+
 ESPHome 2026.10 leaves ESP-IDF's FAT and SD card parts out of builds; this
 component puts them back (`fatfs`, `sdmmc`, `esp_driver_sdmmc`,
-`wear_levelling`) with long file names and FAT's buffers in PSRAM.
+`wear_levelling`) with long file names and FAT's buffers in PSRAM. It also
+keeps ESP-IDF's folder and file-name calls (`CONFIG_VFS_SUPPORT_DIR`:
+`opendir`, `mkdir`, `unlink`, `rename`, `stat`), which ESPHome otherwise
+turns off: without them those calls quietly fail.
 
 Built against ESPHome 2026.10.0 (ESP-IDF 5.5) for the M5Stack Tab5.

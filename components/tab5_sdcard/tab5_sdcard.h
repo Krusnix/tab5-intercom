@@ -16,6 +16,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <sd_protocol_types.h>
 #include <sd_pwr_ctrl.h>
@@ -79,6 +80,39 @@ class SdCard : public Component {
   /// From any task.
   void report_card_error(const char *what);
 
+  // ---- Saving a download (one at a time) ----
+
+  enum SaveState : uint8_t { SAVE_NONE = 0, SAVE_RUNNING = 1, SAVE_DONE = 2, SAVE_FAILED = 3 };
+  /// Downloads `url` (plain http://, home network) into `relative` on the
+  /// card's task: first as relative + ".part", renamed when it's complete.
+  /// Folders on the way are made. At most `max_bytes`. false: no card, or
+  /// a save is still running.
+  bool start_save(const std::string &url, const std::string &relative, uint32_t max_bytes);
+  /// SaveState of the last start_save().
+  uint8_t get_save_state() const { return this->save_state_.load(); }
+  /// Why the last save failed ("" if it didn't).
+  std::string get_save_error() const;
+  /// Bytes saved so far.
+  uint32_t get_save_bytes() const { return this->save_bytes_.load(); }
+  /// While true (during a call), saving pauses between pieces so the card
+  /// leaves the shared SD host to the Wi-Fi chip. From any task.
+  void set_gentle(bool gentle) { this->gentle_.store(gentle); }
+
+  // ---- The files in one folder ----
+
+  /// Lists `folder` (relative; made if missing) on the card's task. Then
+  /// get_files() has the file names, sorted Z to A (newest first for names
+  /// that start with the date), get_files_version() goes up and on_change
+  /// fires. The folder is listed again after remove_file() and
+  /// rename_file(), and after a mount.
+  void scan_folder(const std::string &folder);
+  std::vector<std::string> get_files() const;
+  uint32_t get_files_version() const { return this->files_version_.load(); }
+  /// On the card's task (after the jobs before it), then lists the folder.
+  void remove_file(const std::string &relative);
+  /// Replaces `to` if it is there.
+  void rename_file(const std::string &from, const std::string &to);
+
   Trigger<> *get_change_trigger() { return &this->change_trigger_; }
 
  protected:
@@ -87,6 +121,9 @@ class SdCard : public Component {
   void set_status_(const std::string &status);
   void update_space_();  // card task
   void run_test_();      // card task
+  void save_url_(const std::string &url, const std::string &relative, uint32_t max_bytes);  // card task
+  void scan_();          // card task
+  bool make_dirs_(const std::string &relative_file);  // card task
   static void worker_trampoline_(void *arg);
   void worker_();
 
@@ -118,6 +155,15 @@ class SdCard : public Component {
   std::atomic<bool> busy_{false};
   std::atomic<bool> changed_{false};
   Trigger<> change_trigger_;
+
+  std::atomic<uint8_t> save_state_{SAVE_NONE};
+  std::atomic<uint32_t> save_bytes_{0};
+  std::atomic<bool> gentle_{false};
+  std::string save_error_;  // under lock_
+
+  std::string scan_folder_;          // under lock_
+  std::vector<std::string> files_;   // under lock_
+  std::atomic<uint32_t> files_version_{0};
 };
 
 }  // namespace esphome::tab5_sdcard

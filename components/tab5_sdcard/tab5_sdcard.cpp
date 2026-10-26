@@ -16,13 +16,19 @@
 #include "diskio_sdmmc.h"
 #include "ff.h"
 
+#include <dirent.h>
 #include <fcntl.h>
+#include <lwip/netdb.h>
+#include <lwip/sockets.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace esphome::tab5_sdcard {
@@ -37,6 +43,12 @@ static constexpr UBaseType_t TASK_PRIORITY = 2;
 static constexpr size_t TEST_CHUNK = 64 * 1024;
 static constexpr size_t TEST_BYTES = 4 * 1024 * 1024;
 static constexpr const char *const TEST_FILE = "tab5-test.tmp";
+// Saving downloads: written to the card in pieces of up to 32 KB.
+static constexpr size_t SAVE_CHUNK = 32 * 1024;
+static constexpr int CONNECT_TIMEOUT_MS = 3000;
+static constexpr int READ_TIMEOUT_S = 8;
+// Most files one folder listing keeps.
+static constexpr size_t MAX_LISTED = 200;
 
 std::string SdCard::path(const std::string &relative) const {
   if (relative.empty())
@@ -263,6 +275,7 @@ void SdCard::report_card_error(const char *what) {
   this->run_on_card_task([this]() {
     this->unmount_();
     this->set_status_("Card error: take it out and put it back, then Check SD Card");
+    this->scan_();
   });
 }
 
@@ -284,6 +297,7 @@ void SdCard::check() {
     std::lock_guard<std::mutex> guard(this->lock_);
     this->test_result_ = "Testing...";
   }
+  this->run_on_card_task([this]() { this->scan_(); });
   this->notify_change();
   this->run_on_card_task([this]() { this->run_test_(); });
 }
@@ -437,6 +451,388 @@ void SdCard::run_test_() {
   } else {
     this->update_space_();
   }
+}
+
+// ---------------- Folders ----------------
+
+void SdCard::scan_folder(const std::string &folder) {
+  {
+    std::lock_guard<std::mutex> guard(this->lock_);
+    this->scan_folder_ = folder;
+  }
+  this->run_on_card_task([this]() { this->scan_(); });
+}
+
+std::vector<std::string> SdCard::get_files() const {
+  std::lock_guard<std::mutex> guard(this->lock_);
+  return this->files_;
+}
+
+void SdCard::remove_file(const std::string &relative) {
+  this->run_on_card_task([this, relative]() {
+    if (this->mounted_.load() && unlink(this->path(relative).c_str()) != 0 && errno != ENOENT) {
+      ESP_LOGW(TAG, "Can't delete %s: %s", relative.c_str(), strerror(errno));
+      if (errno == EIO)
+        this->report_card_error("delete");
+    }
+    this->scan_();
+  });
+}
+
+void SdCard::rename_file(const std::string &from, const std::string &to) {
+  this->run_on_card_task([this, from, to]() {
+    if (this->mounted_.load()) {
+      const std::string a = this->path(from), b = this->path(to);
+      unlink(b.c_str());
+      if (rename(a.c_str(), b.c_str()) != 0) {
+        ESP_LOGW(TAG, "Can't rename %s: %s", from.c_str(), strerror(errno));
+        if (errno == EIO)
+          this->report_card_error("rename");
+      }
+    }
+    this->scan_();
+  });
+}
+
+void SdCard::scan_() {
+  std::string folder;
+  {
+    std::lock_guard<std::mutex> guard(this->lock_);
+    folder = this->scan_folder_;
+  }
+  if (folder.empty())
+    return;
+  std::vector<std::string> names;
+  if (this->mounted_.load()) {
+    const std::string dir = this->path(folder);
+    mkdir(dir.c_str(), 0775);  // fine if it's there
+    DIR *d = opendir(dir.c_str());
+    if (d == nullptr) {
+      ESP_LOGW(TAG, "Can't list %s: %s", folder.c_str(), strerror(errno));
+    } else {
+      while (struct dirent *e = readdir(d)) {
+        if (e->d_type == DT_DIR || e->d_name[0] == '.')
+          continue;
+        const size_t len = strlen(e->d_name);
+        if (len > 5 && strcmp(e->d_name + len - 5, ".part") == 0)
+          continue;  // a save that didn't finish
+        names.emplace_back(e->d_name);
+      }
+      closedir(d);
+    }
+    std::sort(names.begin(), names.end(), std::greater<>());
+    if (names.size() > MAX_LISTED)
+      names.resize(MAX_LISTED);
+  }
+  {
+    std::lock_guard<std::mutex> guard(this->lock_);
+    this->files_ = std::move(names);
+  }
+  this->files_version_++;
+  this->notify_change();
+}
+
+bool SdCard::make_dirs_(const std::string &relative_file) {
+  size_t at = 0;
+  while ((at = relative_file.find('/', at + 1)) != std::string::npos) {
+    const std::string dir = this->path(relative_file.substr(0, at));
+    if (mkdir(dir.c_str(), 0775) != 0 && errno != EEXIST) {
+      struct stat st {};
+      if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+        return false;
+    }
+  }
+  return true;
+}
+
+// ---------------- Saving a download ----------------
+
+std::string SdCard::get_save_error() const {
+  std::lock_guard<std::mutex> guard(this->lock_);
+  return this->save_error_;
+}
+
+bool SdCard::start_save(const std::string &url, const std::string &relative, uint32_t max_bytes) {
+  if (!this->mounted_.load() || this->task_ == nullptr || relative.empty())
+    return false;
+  uint8_t state = this->save_state_.load();
+  if (state == SAVE_RUNNING || !this->save_state_.compare_exchange_strong(state, SAVE_RUNNING))
+    return false;
+  this->save_bytes_.store(0);
+  {
+    std::lock_guard<std::mutex> guard(this->lock_);
+    this->save_error_.clear();
+  }
+  if (!this->run_on_card_task([this, url, relative, max_bytes]() { this->save_url_(url, relative, max_bytes); })) {
+    this->save_state_.store(SAVE_FAILED);
+    return false;
+  }
+  return true;
+}
+
+namespace {
+
+// Reads until "\r\n\r\n" or the buffer is full. Returns the bytes read and
+// where the body starts (0 = the end of the headers wasn't found).
+int read_headers(int sock, char *buf, int cap, int *body_at) {
+  int got = 0;
+  *body_at = 0;
+  while (got < cap) {
+    const int r = lwip_recv(sock, buf + got, cap - got, 0);
+    if (r <= 0)
+      return got;
+    got += r;
+    for (int i = std::max(0, got - r - 3); i + 3 < got; i++) {
+      if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+        *body_at = i + 4;
+        return got;
+      }
+    }
+  }
+  return got;
+}
+
+// The value of header `name` (lower case, with the colon), or "".
+std::string header_value(const char *headers, int len, const char *name) {
+  const size_t name_len = strlen(name);
+  int line = 0;
+  while (line < len) {
+    int end = line;
+    while (end < len && headers[end] != '\n')
+      end++;
+    if (static_cast<size_t>(end - line) > name_len) {
+      bool match = true;
+      for (size_t k = 0; k < name_len && match; k++)
+        match = std::tolower(static_cast<unsigned char>(headers[line + k])) == name[k];
+      if (match) {
+        int v = line + static_cast<int>(name_len);
+        while (v < end && (headers[v] == ' ' || headers[v] == '\t'))
+          v++;
+        int e = end;
+        while (e > v && (headers[e - 1] == '\r' || headers[e - 1] == ' '))
+          e--;
+        return std::string(headers + v, e - v);
+      }
+    }
+    line = end + 1;
+  }
+  return "";
+}
+
+// Connects to host:port within CONNECT_TIMEOUT_MS. -1 on failure.
+int connect_to(const std::string &host, int port) {
+  struct addrinfo hints {};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo *res = nullptr;
+  char port_str[8];
+  snprintf(port_str, sizeof(port_str), "%d", port);
+  if (lwip_getaddrinfo(host.c_str(), port_str, &hints, &res) != 0 || res == nullptr)
+    return -1;
+  int sock = lwip_socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (sock >= 0) {
+    const int flags = lwip_fcntl(sock, F_GETFL, 0);
+    lwip_fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    int rc = lwip_connect(sock, res->ai_addr, res->ai_addrlen);
+    if (rc != 0 && errno == EINPROGRESS) {
+      fd_set wfds;
+      FD_ZERO(&wfds);
+      FD_SET(sock, &wfds);
+      struct timeval tv {};
+      tv.tv_sec = CONNECT_TIMEOUT_MS / 1000;
+      tv.tv_usec = (CONNECT_TIMEOUT_MS % 1000) * 1000;
+      rc = lwip_select(sock + 1, nullptr, &wfds, nullptr, &tv) == 1 ? 0 : -1;
+      if (rc == 0) {
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        lwip_getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
+        rc = so_error == 0 ? 0 : -1;
+      }
+    }
+    lwip_fcntl(sock, F_SETFL, flags);
+    if (rc != 0) {
+      lwip_close(sock);
+      sock = -1;
+    }
+  }
+  lwip_freeaddrinfo(res);
+  return sock;
+}
+
+}  // namespace
+
+void SdCard::save_url_(const std::string &url, const std::string &relative, uint32_t max_bytes) {
+  const int64_t t0 = esp_timer_get_time();
+  std::string error;
+  bool card_gone = false;
+  int sock = -1, fd = -1;
+  uint8_t *buf = nullptr;
+  const std::string final_path = this->path(relative);
+  const std::string part_path = final_path + ".part";
+  size_t got = 0;
+
+  // http://host[:port]/path (no https: this stays on the home network)
+  std::string host, req_path = "/";
+  int port = 80;
+  if (url.compare(0, 7, "http://") == 0) {
+    const size_t slash = url.find('/', 7);
+    host = url.substr(7, slash == std::string::npos ? std::string::npos : slash - 7);
+    if (slash != std::string::npos)
+      req_path = url.substr(slash);
+    const size_t colon = host.rfind(':');
+    if (colon != std::string::npos) {
+      port = atoi(host.c_str() + colon + 1);
+      host.resize(colon);
+    }
+  }
+
+  if (host.empty() || port <= 0 || port > 65535) {
+    error = "bad address";
+  } else if (!this->mounted_.load()) {
+    error = "no card";
+  } else if ((sock = connect_to(host, port)) < 0) {
+    error = "can't reach " + host;
+  } else {
+    struct timeval tv {};
+    tv.tv_sec = READ_TIMEOUT_S;
+    lwip_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    lwip_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    // HTTP/1.0: the answer comes in one piece and the connection closes.
+    std::string request = "GET " + req_path + " HTTP/1.0\r\nHost: " + host;
+    if (port != 80)
+      request += ":" + std::to_string(port);
+    request += "\r\nConnection: close\r\nUser-Agent: tab5_sdcard\r\n\r\n";
+    if (lwip_send(sock, request.data(), request.size(), 0) != static_cast<int>(request.size()))
+      error = "can't ask " + host;
+  }
+
+  // Cache-line aligned PSRAM: the SD host moves it without copying.
+  if (error.empty()) {
+    buf = static_cast<uint8_t *>(heap_caps_aligned_alloc(128, SAVE_CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (buf == nullptr)
+      error = "out of memory";
+  }
+
+  long expected = -1;
+  size_t fill = 0;
+  if (error.empty()) {
+    char head[1024];
+    int body_at = 0;
+    const int head_len = read_headers(sock, head, sizeof(head), &body_at);
+    int status = 0;
+    if (body_at > 12 && memcmp(head, "HTTP/", 5) == 0) {
+      const char *space = static_cast<const char *>(memchr(head, ' ', body_at));
+      if (space != nullptr)
+        status = atoi(space + 1);
+    }
+    if (body_at == 0 || status <= 0) {
+      error = head_len <= 0 ? "no answer" : "bad answer";
+    } else if (status != 200) {
+      error = "the other side said " + std::to_string(status);
+    } else if (!header_value(head, body_at, "transfer-encoding:").empty()) {
+      error = "bad answer (chunked)";
+    } else {
+      const std::string cl = header_value(head, body_at, "content-length:");
+      expected = cl.empty() ? -1 : atol(cl.c_str());
+      if (expected > static_cast<long>(max_bytes)) {
+        error = "too big";
+      } else {
+        fill = static_cast<size_t>(head_len - body_at);
+        memcpy(buf, head + body_at, fill);
+      }
+    }
+  }
+
+  if (error.empty()) {
+    if (!this->make_dirs_(relative)) {
+      error = "can't make the folder";
+      card_gone = errno == EIO;
+    } else if ((fd = open(part_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0) {
+      error = std::string("can't make the file (") + strerror(errno) + ")";
+      card_gone = errno == EIO;
+    }
+  }
+
+  // Receive, and write each full 32 KB to the card.
+  bool closed = false;
+  while (error.empty()) {
+    const bool want_more = !closed && (expected < 0 || got + fill < static_cast<size_t>(expected));
+    if (want_more && fill < SAVE_CHUNK) {
+      const int r = lwip_recv(sock, buf + fill, SAVE_CHUNK - fill, 0);
+      if (r > 0) {
+        fill += r;
+        if (got + fill > max_bytes)
+          error = "too big";
+        continue;
+      }
+      if (r < 0 && expected < 0) {
+        error = "the download stopped";
+        break;
+      }
+      closed = true;  // the other side is done (or quiet for too long)
+    }
+    if (fill > 0) {
+      if (write(fd, buf, fill) != static_cast<ssize_t>(fill)) {
+        error = std::string("writing stopped (") + strerror(errno) + ")";
+        card_gone = errno == EIO;
+        break;
+      }
+      got += fill;
+      this->save_bytes_.store(got);
+      fill = 0;
+      if (this->gentle_.load())
+        vTaskDelay(pdMS_TO_TICKS(40));  // leave the SD host to the Wi-Fi chip for a moment
+    }
+    if (!(!closed && (expected < 0 || got < static_cast<size_t>(expected))))
+      break;
+  }
+  if (sock >= 0)
+    lwip_close(sock);
+  if (buf != nullptr)
+    heap_caps_free(buf);
+  if (fd >= 0) {
+    if (error.empty() && fsync(fd) != 0) {
+      error = std::string("writing stopped (") + strerror(errno) + ")";
+      card_gone = errno == EIO;
+    }
+    close(fd);
+  }
+  if (error.empty()) {
+    if (expected >= 0 && got < static_cast<size_t>(expected)) {
+      error = "the download stopped";
+    } else if (got == 0) {
+      error = "nothing came";
+    }
+  }
+  if (error.empty()) {
+    unlink(final_path.c_str());
+    if (rename(part_path.c_str(), final_path.c_str()) != 0) {
+      error = std::string("can't rename it (") + strerror(errno) + ")";
+      card_gone = errno == EIO;
+    }
+  }
+  if (!error.empty() && fd >= 0)
+    unlink(part_path.c_str());
+
+  if (error.empty()) {
+    ESP_LOGI(TAG, "Saved %s (%u bytes, %.1f s)", relative.c_str(), (unsigned) got,
+             (esp_timer_get_time() - t0) / 1e6);
+    // The folder listing and free space are up to date before "saved".
+    this->update_space_();
+    this->scan_();
+    this->save_state_.store(SAVE_DONE);
+    this->notify_change();
+    return;
+  }
+  ESP_LOGW(TAG, "Not saved %s: %s", relative.c_str(), error.c_str());
+  {
+    std::lock_guard<std::mutex> guard(this->lock_);
+    this->save_error_ = error;
+  }
+  this->save_state_.store(SAVE_FAILED);
+  this->notify_change();
+  if (card_gone)
+    this->report_card_error("save");
 }
 
 }  // namespace esphome::tab5_sdcard

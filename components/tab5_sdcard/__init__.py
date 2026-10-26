@@ -29,6 +29,8 @@ from esphome.components.esp32 import (
     add_idf_sdkconfig_option,
     include_builtin_idf_component,
     only_on_variant,
+    require_fatfs,
+    require_vfs_dir,
 )
 import esphome.config_validation as cv
 from esphome.const import CONF_FREQUENCY, CONF_ID
@@ -94,6 +96,10 @@ async def to_code(config):
     # ESP-IDF's SD card and FAT parts (ESPHome leaves them out by default).
     for name in ("fatfs", "sdmmc", "esp_driver_sdmmc", "wear_levelling"):
         include_builtin_idf_component(name)
+    require_fatfs()
+    # Folders, deleting and renaming files (ESPHome turns these off by
+    # default: without them unlink, rename, stat, mkdir and opendir fail).
+    require_vfs_dir()
     # Long file names, FAT's buffers in PSRAM (the internal memory is
     # scarce on the Tab5), sector buffers only as big as the card's sectors.
     add_idf_sdkconfig_option("CONFIG_FATFS_LFN_HEAP", True)
