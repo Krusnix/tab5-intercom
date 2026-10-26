@@ -9,7 +9,7 @@ the components in this repository with:
 ```yaml
 external_components:
   - source: github://Krusnix/tab5-intercom@<commit>
-    components: [tab5_video, tab5_broadcast]
+    components: [tab5_video, tab5_broadcast, tab5_sdcard]
 ```
 
 Always pin a commit (or tag), so a later change here never alters a build
@@ -201,5 +201,58 @@ media_player:
 
 `id(bcast_out).get_played_bytes()` / `reset_played_bytes()` count the audio
 that went through, so a lambda can tell whether a playback made any sound.
+
+### `tab5_sdcard`
+
+The Tab5's microSD card. Its slot is on the ESP32-P4's SD host, slot 0
+(4-bit: CLK 43, CMD 44, D0-D3 39-42), with the pins powered by the P4's
+on-chip LDO 4. The Wi-Fi chip (`esp32_hosted`) sits on slot 1 of the same SD
+host, so this component:
+
+- powers the slot with ESP-IDF's on-chip LDO driver, starts only slot 0 (the
+  host already runs for the Wi-Fi chip) and never shuts the host or the slot
+  down again, so Wi-Fi is never cut off;
+- mounts the card once at start-up, before Wi-Fi connects (setting up a slot
+  changes the shared host's clock), and again only when asked with
+  `check()`. Don't call `check()` during a call;
+- runs at 40 MHz like M5Stack's own Tab5 code (the same host clock as the
+  Wi-Fi chip);
+- does its slow work (free space, the read/write test) on a task of its own,
+  with its stack in PSRAM.
+
+The card must be FAT32 (cards up to 32 GB come that way; exFAT isn't
+supported). Its files are then plain C/POSIX files under the mount point.
+
+```yaml
+tab5_sdcard:
+  id: sd_card
+  mount_point: /sdcard     # default
+  ldo_channel: 4           # default (the Tab5's)
+  frequency: 40MHz         # default; 20MHz for slow cards
+  max_files: 4             # files open at once
+  on_change:               # mounted or not, free space, test result changed
+    - lambda: id(sd_status).publish_state(id(sd_card).get_status());
+```
+
+```cpp
+id(sd_card).is_mounted();      // the files can be used
+id(sd_card).path("a/b.wav");   // "/sdcard/a/b.wav"
+id(sd_card).get_status();      // "Ready", "No card found", "Not FAT32: ..."
+id(sd_card).get_card_info();   // "SDHC 31.9 GB (SD32G), 40 MHz"
+id(sd_card).get_size_gb();     // NAN until known
+id(sd_card).get_free_gb();
+id(sd_card).check();           // mount again if needed, then a 4 MB
+                               // write/read test on the card's task
+id(sd_card).get_test_result(); // "", "Testing...", "OK: writes 9.1 MB/s,
+                               // reads 11.8 MB/s" or "Failed: ..."
+```
+
+`run_on_card_task(job)` queues other card work on the card's task,
+`refresh_space()` measures the free space again, and
+`report_card_error(what)` marks the card as gone until the next `check()`.
+
+ESPHome 2026.10 leaves ESP-IDF's FAT and SD card parts out of builds; this
+component puts them back (`fatfs`, `sdmmc`, `esp_driver_sdmmc`,
+`wear_levelling`) with long file names and FAT's buffers in PSRAM.
 
 Built against ESPHome 2026.10.0 (ESP-IDF 5.5) for the M5Stack Tab5.
