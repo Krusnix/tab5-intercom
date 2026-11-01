@@ -9,7 +9,7 @@ the components in this repository with:
 ```yaml
 external_components:
   - source: github://Krusnix/tab5-intercom@<commit>
-    components: [tab5_video, tab5_broadcast, tab5_sdcard]
+    components: [tab5_video, tab5_broadcast, tab5_sdcard, tab5_wallpaper]
 ```
 
 Always pin a commit (or tag), so a later change here never alters a build
@@ -321,5 +321,69 @@ component puts them back (`fatfs`, `sdmmc`, `esp_driver_sdmmc`,
 keeps ESP-IDF's folder and file-name calls (`CONFIG_VFS_SUPPORT_DIR`:
 `opendir`, `mkdir`, `unlink`, `rename`, `stat`), which ESPHome otherwise
 turns off: without them those calls quietly fail.
+
+### `tab5_wallpaper`
+
+A moving wallpaper behind the lock screen, for a plain `mipi_dsi` display
+(no LVGL). The wallpaper is a looping clip on the SD card: JPEG pictures one
+after the other in one file (an "MJPEG" file, as `ffmpeg -f mjpeg` writes
+it).
+
+How it works:
+
+- the display lambda draws the lock screen as usual, on black, and calls
+  `lock_screen_drawn()` at the end. The component copies what was drawn and
+  keeps the display from sending it to the panel itself;
+- its task reads the file in 32 KB pieces, decodes each picture with the
+  P4's hardware JPEG decoder and lays the lock screen copy over it with the
+  PPA (pure black is see-through), straight into the panel's frame buffer.
+  A change on the lock screen (the slider moving) goes out at once, over
+  the current picture;
+- anything else the lambda draws must call `lock_screen_gone()` first: it
+  stops the wallpaper and waits until it no longer writes to the panel. The
+  next screen must then be sent whole (the panel still shows the wallpaper).
+
+```yaml
+tab5_wallpaper:
+  id: live_wallpaper
+  display_id: main_display                  # mipi_dsi, color_depth 16
+  file: /sdcard/wallpaper/wallpaper.mjpeg   # default
+  framerate: 20                             # default (1-30); a JPEG comment
+                                            # "fps=NN" in the file wins
+  max_picture_size: 800kB                   # default: biggest single picture
+  on_change:
+    - lambda: id(wp_status).publish_state(id(live_wallpaper).get_status());
+```
+
+```cpp
+id(live_wallpaper).lock_screen_drawn();  // end of every lock screen drawing
+id(live_wallpaper).lock_screen_gone();   // before drawing anything else
+id(live_wallpaper).set_enabled(false);   // off: the plain lock screen
+id(live_wallpaper).close_file();         // before replacing the file
+id(live_wallpaper).reload();             // play the (new) file from the start
+id(live_wallpaper).set_note("Downloading: 12 MB");  // shown instead of the state
+id(live_wallpaper).get_status();         // "Playing: 19.8 pictures a second (160, wants 20)",
+                                         // "No wallpaper on the SD card", ...
+```
+
+Each picture is read, decoded and blended in turn (an estimated 40 to 60 ms
+for a 150-200 KB picture, not yet measured), so 15 pictures a second is the
+safe rate; `get_status()` shows what it really manages.
+
+Pictures must be baseline JPEGs of 720 x 1280 (already turned 90 degrees
+counter-clockwise for the Tab5's panel: the quickest) or 1280 x 720 (turned
+by the PPA). Any video becomes one with:
+
+```sh
+ffmpeg -i input.mp4 -t 10 -an \
+  -vf "fps=15,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,transpose=2" \
+  -pix_fmt yuvj420p -q:v 5 -f mjpeg wallpaper.mjpeg
+```
+
+Memory: about 4.5 MB of PSRAM (the picture, the lock screen copy, one JPEG
+and the read buffer), taken the first time a wallpaper plays; 1.8 MB more for
+1280 x 720 pictures. While it plays, the picture rate it really manages
+shows in `get_status()`, and the log gets the rate with the read, decode
+and blend times every 5 s.
 
 Built against ESPHome 2026.10.0 (ESP-IDF 5.5) for the M5Stack Tab5.
