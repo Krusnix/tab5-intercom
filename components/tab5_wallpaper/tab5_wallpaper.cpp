@@ -36,8 +36,8 @@ constexpr size_t kChunkBytes = 32 * 1024;
 constexpr uint32_t kMaxBadPictures = 8;
 // Looking again for a missing or broken file.
 constexpr int64_t kRetryUs = 5LL * 1000 * 1000;
-// Timing written to the log this often while playing.
-constexpr int64_t kStatsUs = 10LL * 1000 * 1000;
+// Timing measured this often while playing (log, and the rate in the state).
+constexpr int64_t kStatsUs = 5LL * 1000 * 1000;
 
 // ---- Reaching into ESPHome's mipi_dsi display ----
 // The display keeps its draw buffer, its panel and the area its lambda
@@ -371,10 +371,17 @@ void Tab5Wallpaper::run_task_() {
     if (!this->active_.load()) {
       if (was_active) {
         was_active = false;
-        if (this->bg_valid_.load() && !this->broken_.load() && this->enabled_.load())
-          this->set_status_(this->file_pictures_ > 0
-                                ? "Ready: " + std::to_string(this->file_pictures_) + " pictures"
-                                : std::string("Ready"));
+        if (this->bg_valid_.load() && !this->broken_.load() && this->enabled_.load()) {
+          std::string words = "Ready";
+          if (this->file_pictures_ > 0)
+            words += ": " + std::to_string(this->file_pictures_) + " pictures";
+          if (this->measured_fps_ > 0.0f) {
+            char b[48];
+            snprintf(b, sizeof(b), " (last played %.1f a second)", this->measured_fps_);
+            words += b;
+          }
+          this->set_status_(words);
+        }
       }
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
       due = 0;
@@ -382,9 +389,8 @@ void Tab5Wallpaper::run_task_() {
     }
     if (!was_active) {
       was_active = true;
-      this->stat_start_us_ = esp_timer_get_time();
-      this->stat_frames_ = this->stat_late_ = 0;
-      this->stat_read_us_ = this->stat_decode_us_ = this->stat_blend_us_ = 0;
+      this->stat_start_us_ = 0;  // timing starts at the first picture shown
+      this->measured_fps_ = 0.0f;
     }
     if (this->broken_.load() || this->out_of_memory_) {
       // Nothing to do until the lock screen goes (lock screen changes
@@ -449,20 +455,39 @@ void Tab5Wallpaper::run_task_() {
     if (!this->ui_valid_.load())
       this->want_ui_.store(true);  // the main task copies the lock screen, then wakes us
     if (shown) {
-      this->stat_blend_us_ += esp_timer_get_time() - t2;
-      this->stat_frames_++;
+      const int64_t t3 = esp_timer_get_time();
+      if (this->stat_start_us_ == 0) {
+        // Timing starts here (not with the start-up before the first picture).
+        this->stat_start_us_ = t3;
+        this->stat_frames_ = this->stat_late_ = 0;
+        this->stat_read_us_ = this->stat_decode_us_ = this->stat_blend_us_ = 0;
+      } else {
+        this->stat_blend_us_ += t3 - t2;
+        this->stat_frames_++;
+      }
       this->frames_shown_.fetch_add(1);
-      const int fps_now = this->file_fps_ != 0 ? this->file_fps_ : this->default_fps_;
-      this->set_status_(this->file_pictures_ > 0 ? "Playing: " + std::to_string(this->file_pictures_) +
-                                                       " pictures, " + std::to_string(fps_now) + " a second"
-                                                 : "Playing: " + std::to_string(fps_now) + " pictures a second");
+      // "Playing: 160 pictures, 20 a second", then what it really manages:
+      // "Playing: 19.8 pictures a second (160, wants 20)"
+      char b[64];
+      if (this->measured_fps_ > 0.0f && this->file_pictures_ > 0) {
+        snprintf(b, sizeof(b), "Playing: %.1f pictures a second (%u, wants %d)", this->measured_fps_,
+                 (unsigned) this->file_pictures_, fps);
+      } else if (this->measured_fps_ > 0.0f) {
+        snprintf(b, sizeof(b), "Playing: %.1f pictures a second (wants %d)", this->measured_fps_, fps);
+      } else if (this->file_pictures_ > 0) {
+        snprintf(b, sizeof(b), "Playing: %u pictures, %d a second", (unsigned) this->file_pictures_, fps);
+      } else {
+        snprintf(b, sizeof(b), "Playing: %d pictures a second", fps);
+      }
+      this->set_status_(b);
     }
 
     const int64_t now = esp_timer_get_time();
-    if (now - this->stat_start_us_ >= kStatsUs && this->stat_frames_ > 0) {
+    if (this->stat_start_us_ != 0 && now - this->stat_start_us_ >= kStatsUs && this->stat_frames_ > 0) {
       const float secs = (now - this->stat_start_us_) / 1e6f;
       const float n = this->stat_frames_;
-      ESP_LOGD(TAG, "%.1f pictures/s (wanted %d): read %.1f ms, decode %.1f ms, blend %.1f ms, late %u",
+      this->measured_fps_ = n / secs;
+      ESP_LOGI(TAG, "%.1f pictures/s (wanted %d): read %.1f ms, decode %.1f ms, blend %.1f ms, late %u",
                n / secs, fps, this->stat_read_us_ / n / 1000.0f, this->stat_decode_us_ / n / 1000.0f,
                this->stat_blend_us_ / n / 1000.0f, (unsigned) this->stat_late_);
       this->stat_start_us_ = now;

@@ -362,7 +362,7 @@ id(live_wallpaper).set_enabled(false);   // off: the plain lock screen
 id(live_wallpaper).close_file();         // before replacing the file
 id(live_wallpaper).reload();             // play the (new) file from the start
 id(live_wallpaper).set_note("Downloading: 12 MB");  // shown instead of the state
-id(live_wallpaper).get_status();         // "Playing: 160 pictures, 20 a second",
+id(live_wallpaper).get_status();         // "Playing: 19.8 pictures a second (160, wants 20)",
                                          // "No wallpaper on the SD card", ...
 ```
 
@@ -378,7 +378,8 @@ ffmpeg -i input.mp4 -t 10 -an \
 
 Memory: about 4.5 MB of PSRAM (the picture, the lock screen copy, one JPEG
 and the read buffer), taken the first time a wallpaper plays; 1.8 MB more for
-1280 x 720 pictures. Timing (picture rate, read, decode and blend times) goes
-to the log at DEBUG level every 10 s while it plays.
+1280 x 720 pictures. While it plays, the picture rate it really manages
+shows in `get_status()`, and the log gets the rate with the read, decode
+and blend times every 5 s.
 
 Built against ESPHome 2026.10.0 (ESP-IDF 5.5) for the M5Stack Tab5.

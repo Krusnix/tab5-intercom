@@ -95,8 +95,8 @@ class Tab5Wallpaper : public Component {
   /// True while pictures go to the screen (the lock screen is up and the
   /// wallpaper plays).
   bool is_playing() const { return this->active_.load() && this->showing_(); }
-  /// One short sentence for Home Assistant: "Playing: 160 pictures, 20 a
-  /// second", "No wallpaper on the SD card", ...
+  /// One short sentence for Home Assistant: "Playing: 19.8 pictures a
+  /// second (160, wants 20)", "No wallpaper on the SD card", ...
   std::string get_status() const;
   /// Pictures shown since start-up.
   uint32_t get_frames_shown() const { return this->frames_shown_.load(); }
@@ -201,8 +201,9 @@ class Tab5Wallpaper : public Component {
   uint32_t bad_pictures_{0};             // in a row
   std::atomic<uint32_t> frames_shown_{0};
 
-  // Timing (task), logged every 10 s while playing
+  // Timing (task), measured every 5 s while playing
   uint32_t stat_frames_{0}, stat_late_{0};
+  float measured_fps_{0.0f};             // pictures a second, last measured
   int64_t stat_start_us_{0}, stat_read_us_{0}, stat_decode_us_{0}, stat_blend_us_{0};
 
   // Status (any task, under status_lock_)
