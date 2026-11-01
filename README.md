@@ -366,13 +366,17 @@ id(live_wallpaper).get_status();         // "Playing: 19.8 pictures a second (16
                                          // "No wallpaper on the SD card", ...
 ```
 
+Each picture is read, decoded and blended in turn (an estimated 40 to 60 ms
+for a 150-200 KB picture, not yet measured), so 15 pictures a second is the
+safe rate; `get_status()` shows what it really manages.
+
 Pictures must be baseline JPEGs of 720 x 1280 (already turned 90 degrees
 counter-clockwise for the Tab5's panel: the quickest) or 1280 x 720 (turned
 by the PPA). Any video becomes one with:
 
 ```sh
 ffmpeg -i input.mp4 -t 10 -an \
-  -vf "fps=20,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,transpose=2" \
+  -vf "fps=15,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,transpose=2" \
   -pix_fmt yuvj420p -q:v 5 -f mjpeg wallpaper.mjpeg
 ```
 
