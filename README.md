@@ -9,7 +9,7 @@ the components in this repository with:
 ```yaml
 external_components:
   - source: github://Krusnix/tab5-intercom@<commit>
-    components: [tab5_video, tab5_broadcast, tab5_sdcard, tab5_wallpaper]
+    components: [tab5_video, tab5_broadcast, tab5_sdcard, tab5_wallpaper, tab5_watchdog]
 ```
 
 Always pin a commit (or tag), so a later change here never alters a build
@@ -387,3 +387,40 @@ shows in `get_status()`, and the log gets the rate with the read, decode
 and blend times every 5 s.
 
 Built against ESPHome 2026.10.0 (ESP-IDF 5.5) for the M5Stack Tab5.
+
+### `tab5_watchdog`
+
+A freeze guard for the ESPHome main loop. When the main loop can't run for
+5 s, ESP-IDF's task watchdog restarts the chip, and ESPHome's crash report
+only shows where the restarting processor happened to be, not what kept the
+main loop from running.
+
+- Two small tasks (`t5wd_cpu0`, `t5wd_cpu1`, priority 20) look every 25 ms,
+  from the other core, at which task each core is running, and keep the
+  last 2.5 s.
+- If the main loop is ready to run but another task has kept its core for
+  2.5 s, that task (if its priority is between 2 and 21) gets the main
+  loop's priority, 1, so the two take turns. It gets its own priority back
+  once it calms down. The log (`tab5_watchdog`, warning) names it and shows
+  what both cores ran.
+- If the chip is restarted anyway, the watchdog interrupt notes which task
+  each core ran, what they ran most in the last 2.5 s, whether the main loop
+  was running, waiting or crowded out, which component it was in, and the
+  return addresses on its stack. After the restart this is logged every
+  20 s for 10 minutes (and in `dump_config`), with the addresses as
+  `BT0: 0x...` lines that the ESPHome Builder's log view turns into function
+  names.
+
+```yaml
+tab5_watchdog:
+  id: freeze_guard
+
+text_sensor:
+  - platform: template
+    name: Freeze Report
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: return id(freeze_guard).get_report();  # one line, at most 250 characters
+```
+
+Built against ESPHome 2026.10.0 (ESP-IDF 5.5) for the ESP32-P4.
