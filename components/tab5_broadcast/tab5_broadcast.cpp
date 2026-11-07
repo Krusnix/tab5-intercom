@@ -237,6 +237,10 @@ esp_err_t ClipServer::handle_get_(httpd_req_t *req) {
 
 #ifdef USE_SPEAKER
 
+// Longest piece of audio passed on at once (a quarter of a resampler's
+// 128 ms buffer).
+static constexpr uint32_t MAX_PIECE_MS = 32;
+
 void BroadcastSpeaker::setup() {
   // Report played audio upward (the media player uses it for progress).
   this->output_->add_audio_output_callback(
@@ -271,6 +275,7 @@ void BroadcastSpeaker::stop() { this->output_->stop(); }
 void BroadcastSpeaker::finish() { this->output_->finish(); }
 
 size_t BroadcastSpeaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_wait) {
+  const TickType_t started = xTaskGetTickCount();
   // The output starts by itself on its first play(); it has to know the
   // stream before that.
   if (this->output_->is_stopped()) {
@@ -281,8 +286,28 @@ size_t BroadcastSpeaker::play(const uint8_t *data, size_t length, TickType_t tic
     vTaskDelay(ticks_to_wait > 0 ? ticks_to_wait : 1);
     return 0;
   }
+
+  // Pass on small pieces. A resampler keeps 128 ms in a ring buffer, and a
+  // piece bigger than that buffer never fits at once, so its play() comes
+  // back straight away instead of waiting for room. The decode task (8 KB
+  // pieces, 256 ms at 16 kHz) then calls again and again, and kept CPU 1
+  // from the main loop until the task watchdog restarted the chip.
+  const size_t frame = this->audio_stream_info_.frames_to_bytes(1);
+  size_t most = this->audio_stream_info_.ms_to_bytes(MAX_PIECE_MS);
+  if (frame > 0)
+    most -= most % frame;
+  if (most > 0 && length > most)
+    length = most;
+
   const size_t written = this->output_->play(data, length, ticks_to_wait);
   this->played_ += written;
+  if (written == 0 && ticks_to_wait > 0) {
+    // Nothing taken and back early: wait out the rest, so the caller can
+    // never spin.
+    const TickType_t spent = xTaskGetTickCount() - started;
+    if (spent < ticks_to_wait)
+      vTaskDelay(ticks_to_wait - spent);
+  }
   return written;
 }
 
