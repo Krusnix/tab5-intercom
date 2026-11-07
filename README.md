@@ -8,14 +8,419 @@ the components in this repository with:
 
 ```yaml
 external_components:
-  - source: github://Krusnix/tab5-intercom@<tag>
-    components: [tab5_video]
+  - source: github://Krusnix/tab5-intercom@<commit>
+    components: [tab5_video, tab5_broadcast, tab5_sdcard, tab5_wallpaper, tab5_watchdog]
 ```
 
-Always pin a tag, so a later change here never alters a build by surprise.
+Always pin a commit (or tag), so a later change here never alters a build
+by surprise.
 
 ## Components
 
-- `tab5_video` (coming next): shows the other person's picture during a
-  VoIP Stack video call on a Tab5 whose screen is drawn with a normal
-  ESPHome display lambda (no LVGL).
+### `tab5_video`
+
+Video calls for a VoIP Stack (`n-IA-hane/esphome-voip-stack`, JPEG video
+profile) ESP32-P4 device whose screen is drawn with a normal ESPHome display
+lambda. VoIP Stack's own `p4_video_renderer` needs LVGL, and ESPHome does not
+allow LVGL next to a display lambda, so this component does the receive side
+without LVGL:
+
+- Each received JPEG picture is decoded by the P4's hardware JPEG decoder on
+  a small task of its own (stack in PSRAM).
+- The ESPHome main loop scales it with the PPA to fill a rectangle of the
+  screen (cutting off at most `max_crop`, otherwise with black bars), turns it
+  to match the display's rotation, and writes it straight to the panel. All
+  panel writes stay on the main loop, like the display lambda's.
+- `has_frame()` is true while a picture is on the screen, so the lambda can
+  draw only what is outside the picture. `on_first_frame` and
+  `on_video_ended` tell it when to change layout. The picture goes off when
+  the call's video ends or when no picture arrived for `no_video_timeout`.
+
+The optional `camera:` block adds a gate in front of the camera's
+`esp_jpeg_video_source`. Give the gate to VoIP Stack as `video.source`.
+VoIP Stack can only change video direction during a call if video was agreed
+when the call started, and it agrees to send only while sending is wanted.
+With the gate, VoIP Stack always agrees on video both ways, while the camera
+itself stays off at the start of every call. `set_enabled(true)` starts it
+during a call; it stops again by itself when the call's video ends.
+
+The gate also hands every picture it sends to the view's **self view**: the
+device's own picture, scaled down and mirrored (like a mirror; the other side
+sees it the right way round). The display lambda says where it goes with
+`id(remote_video).set_self_view(x, y, w, h)` on every drawing (0 width hides
+it); it is drawn again right after each screen update, and over the other
+side's picture it is put into that picture before it reaches the panel, so
+it never flickers. Turn it off with `self_view: false`.
+
+```yaml
+esp_jpeg_video_source:
+  id: camera_video
+  camera_id: tab5_camera
+  width: 640
+  height: 360
+  framerate: 10
+
+tab5_video:
+  id: remote_video
+  display_id: main_display
+  display_rotation: 270        # same as the display's rotation:
+  area: {x: 0, y: 0, width: 1280, height: 620}
+  width: 640                   # picture size asked of the other side
+  height: 360
+  framerate: 10
+  # max_decode_width: 1280     # largest picture accepted from any caller
+  # max_decode_height: 720
+  # max_crop: 15%
+  # no_video_timeout: 3s
+  # swap_red_blue: false       # if red and blue come out swapped
+  camera:
+    id: camera_gate
+    source_id: camera_video
+    # self_view: true          # own picture where set_self_view() says
+    # self_view_mirror: true
+    # self_view_framerate: 10
+    # width: 640               # the camera's call picture size
+    # height: 360
+  on_first_frame:
+    - component.update: main_display
+  on_video_ended:
+    - component.update: main_display
+
+voip_stack:
+  video:
+    codec: jpeg
+    source: camera_gate
+    sink: remote_video
+    width: 640
+    height: 360
+    framerate: 10
+    rtp_port: 40002
+    offer_payload_type: 26
+    max_rtp_payload: 1400
+```
+
+In lambdas: `id(remote_video).has_frame()`, `is_receiving()`,
+`frames_shown()`, `decode_errors()`, `set_self_view(x, y, w, h)`,
+`get_self_view(&x, &y, &w, &h)`, and `id(camera_gate).set_enabled(bool)`,
+`is_enabled()`, `is_available()`.
+
+#### Still pictures (doorbell camera)
+
+Outside calls, the same rectangle can show a still JPEG picture fetched over
+plain HTTP, for example a Home Assistant camera's latest picture:
+
+```yaml
+tab5_video:
+  # ...
+  on_picture:              # picture changed, went away, or fetching failed
+    - component.update: main_display
+```
+
+```cpp
+// From a lambda on the main loop; call again every few seconds to pick up
+// a newer picture (the screen only changes when the picture did).
+id(remote_video).show_picture("http://192.168.4.114/api/camera_proxy/camera.front_door?token=...&width=960&height=540");
+id(remote_video).hide_picture();
+```
+
+- A small task of its own (stack in PSRAM) fetches the picture with a plain
+  HTTP/1.0 GET (no https), into a 1 MB PSRAM buffer made on first use. The
+  same hardware decoder and PPA path as call video put it on the screen.
+- An unchanged picture (same checksum) is not decoded or drawn again.
+- A call's video always wins: `show_picture()` refuses while one is set up,
+  and a call's video starting turns the still picture off.
+- `has_picture()`, `picture_mode()`, `picture_error()` (a short sentence, or
+  `""`), `picture_changed_ms()`, `picture_width()`, `picture_height()`.
+- Pictures bigger than `max_decode_width` x `max_decode_height` are refused
+  (Home Assistant's camera proxy shrinks them when given `width` and
+  `height`). Baseline JPEG only (the P4 hardware decoder).
+
+Note for the display lambda (built-in `mipi_dsi`): that driver only sends
+pixels that changed in its own buffer. After the picture goes away, mark the
+whole screen as changed before drawing (for example by drawing two corner
+pixels in two different colours), or parts of the last picture stay. The
+same goes for the self view's old rectangle when it moves or is hidden.
+
+Built against ESPHome 2026.10.0, VoIP Stack v2026.11.0-dev and
+esphome-esp-video-camera v2026.10.0-dev for the M5Stack Tab5.
+
+### `tab5_broadcast`
+
+Broadcasts between the two Tab5s: one Tab5 records a few seconds of voice,
+the other one plays it right away. Two parts:
+
+**The clip server** (`tab5_broadcast:`) keeps this Tab5's newest recording
+and serves it as a WAV file on a small HTTP server of its own (ESP-IDF
+`esp_http_server`, plain http, home network only). The other Tab5 plays it
+straight from there with its `speaker_source` media player and an
+`audio_http` media source, so the audio never goes through Home Assistant;
+Home Assistant only passes the address on (an ESPHome API action).
+
+```yaml
+tab5_broadcast:
+  id: bc_server
+  port: 8099               # default
+```
+
+```cpp
+// 16-bit mono samples (for example the microphone's, collected in PSRAM).
+// Returns "http://<ip>:8099/broadcast/<id>.wav", or "" (no IPv4 address,
+// no memory). Only the newest clip is kept; an older address answers 404.
+std::string url = id(bc_server).publish_clip(samples, count, 16000);
+```
+
+- The clip is copied into PSRAM with a 44-byte WAV header, and a 10 ms fade
+  in and out (no click at either end).
+- Each clip gets a random id in its address, so an old address never plays
+  a newer recording.
+- At most two clients at a time; the server's task stack is in PSRAM. If
+  the network isn't up yet it tries again every 10 s.
+- `get_clip_url()`, `clear_clip()`, `get_fetch_count()`, `is_running()`.
+
+**The pass-through speaker** (`speaker: - platform: tab5_broadcast`) goes
+between a media player and the rest of its speaker chain. A media player sets
+the volume and mute of its speaker, and the mixer and resampler speakers pass
+those down to the hardware speaker, where they would change the volume of
+calls and the ring too. This speaker passes the audio through unchanged and
+keeps volume and mute to itself; set how loud the media player plays some
+other way, for example with the mixer source's ducking
+(`id(mixer_input)->apply_ducking(db, 0)`).
+
+```yaml
+speaker:
+  - platform: tab5_broadcast
+    id: bcast_out
+    output_speaker: bcast_resampler   # resampler -> mixer source -> hardware
+
+media_player:
+  - platform: speaker_source
+    media_pipeline:
+      speaker: bcast_out
+      # ...
+```
+
+`id(bcast_out).get_played_bytes()` / `reset_played_bytes()` count the audio
+that went through, so a lambda can tell whether a playback made any sound.
+
+### `tab5_sdcard`
+
+The Tab5's microSD card. Its slot is on the ESP32-P4's SD host, slot 0
+(4-bit: CLK 43, CMD 44, D0-D3 39-42), with the pins powered by the P4's
+on-chip LDO 4. The Wi-Fi chip (`esp32_hosted`) sits on slot 1 of the same SD
+host, so this component:
+
+- powers the slot with ESP-IDF's on-chip LDO driver, starts only slot 0 (the
+  host already runs for the Wi-Fi chip) and never shuts the host or the slot
+  down again, so Wi-Fi is never cut off;
+- mounts the card once at start-up, before Wi-Fi connects (setting up a slot
+  changes the shared host's clock), and again only when asked with
+  `check()`. Don't call `check()` during a call;
+- runs at 40 MHz like M5Stack's own Tab5 code (the same host clock as the
+  Wi-Fi chip);
+- does its slow work (free space, the read/write test) on a task of its own,
+  with its stack in PSRAM.
+
+The card must be FAT32 (cards up to 32 GB come that way; exFAT isn't
+supported). Its files are then plain C/POSIX files under the mount point.
+
+```yaml
+tab5_sdcard:
+  id: sd_card
+  mount_point: /sdcard     # default
+  ldo_channel: 4           # default (the Tab5's)
+  frequency: 40MHz         # default; 20MHz for slow cards
+  max_files: 4             # files open at once
+  on_change:               # mounted or not, free space, test result changed
+    - lambda: id(sd_status).publish_state(id(sd_card).get_status());
+```
+
+```cpp
+id(sd_card).is_mounted();      // the files can be used
+id(sd_card).path("a/b.wav");   // "/sdcard/a/b.wav"
+id(sd_card).get_status();      // "Ready", "No card found", "Not FAT32: ..."
+id(sd_card).get_card_info();   // "SDHC 31.9 GB (SD32G), 40 MHz"
+id(sd_card).get_size_gb();     // NAN until known
+id(sd_card).get_free_gb();
+id(sd_card).check();           // mount again if needed, then a 4 MB
+                               // write/read test on the card's task
+id(sd_card).get_test_result(); // "", "Testing...", "OK: writes 9.1 MB/s,
+                               // reads 11.8 MB/s" or "Failed: ..."
+```
+
+`run_on_card_task(job)` queues other card work on the card's task,
+`refresh_space()` measures the free space again, and
+`report_card_error(what)` marks the card as gone until the next `check()`.
+
+#### Saving a download, and the files in a folder
+
+The card's task can save a plain `http://` download (one at a time), and
+keep a list of the files in one folder. Both are for voicemails (the other
+Tab5's recording, fetched from its `tab5_broadcast` clip server), but take
+any file.
+
+```cpp
+// Downloads into /sdcard/voicemail/x.wav (first as x.wav.part, renamed when
+// complete; folders are made). false: no card, or a save is running.
+id(sd_card).start_save("http://192.168.4.50:8099/broadcast/1a2b.wav",
+                       "voicemail/x.wav", 3 * 1024 * 1024);
+id(sd_card).get_save_state();  // 0 none, 1 running, 2 done, 3 failed
+id(sd_card).get_save_error();  // "can't reach 192.168.4.50", "too big" ...
+id(sd_card).set_gentle(true);  // during a call: a 40 ms pause after each
+                               // 32 KB written, so Wi-Fi keeps the SD host
+
+id(sd_card).scan_folder("voicemail");  // list it (made if missing)
+id(sd_card).get_files();               // names, Z to A (newest first for
+                                       // names that start with the date)
+id(sd_card).get_files_version();       // goes up with each new list
+id(sd_card).remove_file("voicemail/x.wav");
+id(sd_card).rename_file("voicemail/x.wav", "voicemail/y.wav");
+```
+
+A finished save, `remove_file()` and `rename_file()` list the folder again, then
+`on_change` fires. `.part` files, folders and hidden files aren't listed.
+
+#### Playing WAV files from the card
+
+A media source for a `speaker_source` media player:
+`sdcard://voicemail/x.wav` plays `/sdcard/voicemail/x.wav`. Plain 16-bit
+PCM WAV only (mono or stereo, 8 to 48 kHz), read in 8 KB pieces on a task
+of its own with its stack in PSRAM. Pause, resume and stop work as for
+other sources.
+
+```yaml
+media_source:
+  - platform: tab5_sdcard
+    id: vm_source
+
+media_player:
+  - platform: speaker_source
+    media_pipeline:
+      sources: [http_source, vm_source]
+      # ...
+```
+
+#### Voicemail file names
+
+`voicemail.h` has helpers for files named
+`20261026-224301_Mom_23s_new.wav` (when, who, how long, and `_new` until
+played), usable in lambdas:
+
+```cpp
+auto vm = tab5_sdcard::parse_voicemail(name);  // vm.from, vm.year .. vm.minute,
+                                               // vm.seconds, vm.is_new, vm.key
+tab5_sdcard::voicemail_file_name(id(ha_time).now(), "Mom", 23);
+tab5_sdcard::voicemail_heard_name(name);       // without "_new"
+tab5_sdcard::voicemail_when(vm, now, false);   // "Today 2:41 PM", "Oct 26, 2:41 PM"
+tab5_sdcard::voicemail_time(vm, false);        // "2:41 PM"
+tab5_sdcard::voicemail_length(23);             // "0:23"
+```
+
+ESPHome 2026.10 leaves ESP-IDF's FAT and SD card parts out of builds; this
+component puts them back (`fatfs`, `sdmmc`, `esp_driver_sdmmc`,
+`wear_levelling`) with long file names and FAT's buffers in PSRAM. It also
+keeps ESP-IDF's folder and file-name calls (`CONFIG_VFS_SUPPORT_DIR`:
+`opendir`, `mkdir`, `unlink`, `rename`, `stat`), which ESPHome otherwise
+turns off: without them those calls quietly fail.
+
+### `tab5_wallpaper`
+
+A moving wallpaper behind the lock screen, for a plain `mipi_dsi` display
+(no LVGL). The wallpaper is a looping clip on the SD card: JPEG pictures one
+after the other in one file (an "MJPEG" file, as `ffmpeg -f mjpeg` writes
+it).
+
+How it works:
+
+- the display lambda draws the lock screen as usual, on black, and calls
+  `lock_screen_drawn()` at the end. The component copies what was drawn and
+  keeps the display from sending it to the panel itself;
+- its task reads the file in 32 KB pieces, decodes each picture with the
+  P4's hardware JPEG decoder and lays the lock screen copy over it with the
+  PPA (pure black is see-through), straight into the panel's frame buffer.
+  A change on the lock screen (the slider moving) goes out at once, over
+  the current picture;
+- anything else the lambda draws must call `lock_screen_gone()` first: it
+  stops the wallpaper and waits until it no longer writes to the panel. The
+  next screen must then be sent whole (the panel still shows the wallpaper).
+
+```yaml
+tab5_wallpaper:
+  id: live_wallpaper
+  display_id: main_display                  # mipi_dsi, color_depth 16
+  file: /sdcard/wallpaper/wallpaper.mjpeg   # default
+  framerate: 20                             # default (1-30); a JPEG comment
+                                            # "fps=NN" in the file wins
+  max_picture_size: 800kB                   # default: biggest single picture
+  on_change:
+    - lambda: id(wp_status).publish_state(id(live_wallpaper).get_status());
+```
+
+```cpp
+id(live_wallpaper).lock_screen_drawn();  // end of every lock screen drawing
+id(live_wallpaper).lock_screen_gone();   // before drawing anything else
+id(live_wallpaper).set_enabled(false);   // off: the plain lock screen
+id(live_wallpaper).close_file();         // before replacing the file
+id(live_wallpaper).reload();             // play the (new) file from the start
+id(live_wallpaper).set_note("Downloading: 12 MB");  // shown instead of the state
+id(live_wallpaper).get_status();         // "Playing: 19.8 pictures a second (160, wants 20)",
+                                         // "No wallpaper on the SD card", ...
+```
+
+Each picture is read, decoded and blended in turn (an estimated 40 to 60 ms
+for a 150-200 KB picture, not yet measured), so 15 pictures a second is the
+safe rate; `get_status()` shows what it really manages.
+
+Pictures must be baseline JPEGs of 720 x 1280 (already turned 90 degrees
+counter-clockwise for the Tab5's panel: the quickest) or 1280 x 720 (turned
+by the PPA). Any video becomes one with:
+
+```sh
+ffmpeg -i input.mp4 -t 10 -an \
+  -vf "fps=15,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,transpose=2" \
+  -pix_fmt yuvj420p -q:v 5 -f mjpeg wallpaper.mjpeg
+```
+
+Memory: about 4.5 MB of PSRAM (the picture, the lock screen copy, one JPEG
+and the read buffer), taken the first time a wallpaper plays; 1.8 MB more for
+1280 x 720 pictures. While it plays, the picture rate it really manages
+shows in `get_status()`, and the log gets the rate with the read, decode
+and blend times every 5 s.
+
+Built against ESPHome 2026.10.0 (ESP-IDF 5.5) for the M5Stack Tab5.
+
+### `tab5_watchdog`
+
+A freeze guard for the ESPHome main loop. When the main loop can't run for
+5 s, ESP-IDF's task watchdog restarts the chip, and ESPHome's crash report
+only shows where the restarting processor happened to be, not what kept the
+main loop from running.
+
+- Two small tasks (`t5wd_cpu0`, `t5wd_cpu1`, priority 20) look every 25 ms,
+  from the other core, at which task each core is running, and keep the
+  last 2.5 s.
+- If the main loop is ready to run but another task has kept its core for
+  2.5 s, that task (if its priority is between 2 and 21) gets the main
+  loop's priority, 1, so the two take turns. It gets its own priority back
+  once it calms down. The log (`tab5_watchdog`, warning) names it and shows
+  what both cores ran.
+- If the chip is restarted anyway, the watchdog interrupt notes which task
+  each core ran, what they ran most in the last 2.5 s, whether the main loop
+  was running, waiting or crowded out, which component it was in, and the
+  return addresses on its stack. After the restart this is logged every
+  20 s for 10 minutes (and in `dump_config`), with the addresses as
+  `BT0: 0x...` lines that the ESPHome Builder's log view turns into function
+  names.
+
+```yaml
+tab5_watchdog:
+  id: freeze_guard
+
+text_sensor:
+  - platform: template
+    name: Freeze Report
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: return id(freeze_guard).get_report();  # one line, at most 250 characters
+```
+
+Built against ESPHome 2026.10.0 (ESP-IDF 5.5) for the ESP32-P4.
